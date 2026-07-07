@@ -119,15 +119,14 @@ services:
     networks:
       - deepaudit-network
 
-  # 沙箱镜像构建服务 (漏洞验证必须)
-  # 注意: 此服务仅用于构建镜像，构建完成后自动退出
+  # 沙箱镜像 (漏洞验证必须)
+  # 已改为直接使用预构建镜像，避免本地构建时 apt 镜像源 403 问题
+  # 前置：docker pull ghcr.nju.edu.cn/lintsinghua/deepaudit-sandbox:latest
+  #      docker tag  ghcr.nju.edu.cn/lintsinghua/deepaudit-sandbox:latest deepaudit/sandbox:latest
   sandbox:
-    build:
-      context: ./docker/sandbox
-      dockerfile: Dockerfile
     image: deepaudit/sandbox:latest
     restart: "no"
-    command: echo "Sandbox image built successfully"
+    command: echo "Sandbox image ready (using prebuilt)"
 
 networks:
   deepaudit-network:
