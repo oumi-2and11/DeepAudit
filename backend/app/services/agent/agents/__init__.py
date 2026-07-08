@@ -12,6 +12,7 @@ from .orchestrator import OrchestratorAgent
 from .recon import ReconAgent
 from .analysis import AnalysisAgent
 from .verification import VerificationAgent
+from .refinement import RefinementAgent
 
 __all__ = [
     "BaseAgent",
@@ -22,5 +23,6 @@ __all__ = [
     "ReconAgent",
     "AnalysisAgent",
     "VerificationAgent",
+    "RefinementAgent",
 ]
 

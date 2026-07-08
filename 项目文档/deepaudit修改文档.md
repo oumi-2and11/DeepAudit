@@ -267,6 +267,17 @@ C 项目审计中，AFL++ / libFuzzer 的价值远超"跑一次 PoC"。新增 `f
 
 ## 4. 低置信度发现的验证回压 / 二次分析
 
+**✅ 已实现 (2026-07-08)**
+
+实现要点：
+- 新增 `backend/app/services/agent/agents/refinement.py`（`RefinementAgent`）
+- 分桶：conf≥0.8 直接放行；0.5≤conf<0.8 走 Refinement 精修；conf<0.5 直接丢
+- 精修流程：确定性 `read_file(l±30)` + 可选 `search_code(sink)` → 单次 LLM 判决 → verdict ∈ {confirmed, false_positive, still_unclear}
+- Orchestrator 硬约束：Analysis 完成后必须先 Refinement 再 Verification（`_dispatch_agent` 直接拦截）
+- 新的 handoff 链路：Recon → Analysis → Refinement → Verification
+- 报告端：`扫描但过滤` 分区（Refinement 丢弃）+ `待人工确认` 分区（still_unclear）
+- 涉及文件：refinement.py（新）/ orchestrator.py / agents/__init__.py / api/v1/endpoints/agent_tasks.py
+
 ### 4.1 当前问题
 
 抽 20 份报告归纳出的通病：

@@ -37,7 +37,13 @@ ORCHESTRATOR_SYSTEM_PROMPT = """你是 DeepAudit 的编排 Agent，负责**自�
 ## 你可以调度的子 Agent
 1. **recon**: 信息收集 Agent - 分析项目结构、技术栈、入口点
 2. **analysis**: 分析 Agent - 深度代码审计、漏洞检测
-3. **verification**: 验证 Agent - 验证发现的漏洞、生成 PoC
+3. **refinement**: 复审 Agent - 对 Analysis 输出的低置信度发现做二次分析（🔥 §4 修改方案）
+4. **verification**: 验证 Agent - 验证发现的漏洞、生成 PoC
+
+## ⚠️ 强制审计流程 (deepaudit修改文档.md §4)
+Analysis 完成后**必须**先调度 refinement 再调度 verification。
+不允许把 Analysis 的原始 findings 直接交给 verification —— 一句话、无 code_snippet
+的低置信度发现会让 verification 无从下手。refinement 的输出才是 verification 的输入。
 
 ## 你可以使用的操作
 
@@ -83,7 +89,8 @@ Action Input: [JSON 参数]
 ## 审计策略建议
 - 先用 recon Agent 了解项目全貌（只需调度一次）
 - 根据 recon 结果，让 analysis Agent 重点审计高风险区域
-- 发现可疑漏洞后，用 verification Agent 验证
+- 🔥 analysis 完成后**必须**调度 refinement，对 60% 置信度的一句话 finding 做二次分析
+- 只有 refinement 过滤/升格后的发现才能送 verification
 - 随时根据新发现调整策略，不要机械执行
 - 当你认为审计足够全面时，选择 finish
 
@@ -99,7 +106,8 @@ Action Input: [JSON 参数]
 - 即使结果看起来不完整，也要基于已有信息继续推进
 - 不要反复调度同一个 Agent 期望得到不同结果
 - 如果 recon 完成后，应该调度 analysis 进行深度分析
-- 如果 analysis 完成后有发现，可以调度 verification 验证
+- 🔥 如果 analysis 完成后有发现，**必须先调度 refinement** 做二次分析
+- refinement 完成后再调度 verification 验证 refinement 放行的发现
 - 如果没有更多工作要做，使用 finish 结束审计
 
 现在，基于项目信息开始你的审计工作！"""
@@ -166,6 +174,11 @@ class OrchestratorAgent(BaseAgent):
 
         # 🔥 保存各个 Agent 返回的 TaskHandoff，用于 Agent 间通信
         self._agent_handoffs: Dict[str, TaskHandoff] = {}  # agent_name -> TaskHandoff
+
+        # 🔥 §4: Refinement 阶段的产物，供报告端使用
+        self._dropped_findings: List[Dict[str, Any]] = []   # 被 Refinement 判为误报或低置信度丢弃
+        self._unclear_findings: List[Dict[str, Any]] = []   # Refinement 拿不准，进"待人工确认"分区
+        self._refinement_done: bool = False                  # 硬约束：Refinement 未跑过时禁止 dispatch verification
     
     def register_sub_agent(self, name: str, agent: BaseAgent):
         """注册子 Agent"""
@@ -227,6 +240,9 @@ class OrchestratorAgent(BaseAgent):
         self._all_findings = []
         self._agent_results = {}  # 🔥 重置 Agent 结果缓存
         self._agent_handoffs = {}  # 🔥 重置 Agent handoff 缓存
+        self._dropped_findings = []  # 🔥 §4: 重置 Refinement 产物
+        self._unclear_findings = []
+        self._refinement_done = False
         final_result = None
         error_message = None  # 🔥 跟踪错误信息
         
@@ -500,6 +516,9 @@ Action Input: {{"参数": "值"}}
                 success=True,
                 data={
                     "findings": self._all_findings,
+                    # 🔥 §4: 报告端消费的两个新分区
+                    "dropped_findings": self._dropped_findings,
+                    "unclear_findings": self._unclear_findings,
                     "summary": final_result or self._generate_default_summary(),
                     "steps": [
                         {
@@ -665,7 +684,27 @@ Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
             available = list(self.sub_agents.keys())
             logger.warning(f"[Orchestrator] Agent '{agent_name}' 不存在，可用: {available}")
             return f"错误: Agent '{agent_name}' 不存在。可用的 Agent: {available}"
-        
+
+        # 🔥 §4 硬约束：verification 必须在 refinement 之后
+        # 如果 analysis 已经跑过、但 refinement 还没跑过，就把 verification 拦下来。
+        # 这一层不是软提示，是真的把 LLM 决策掐掉——防止 Agent 在 Analysis 出结果后
+        # 直接扑向 Verification 造成 §4 被跳过。
+        if (
+            agent_name == "verification"
+            and "refinement" in self.sub_agents
+            and "analysis" in self._agent_results
+            and not self._refinement_done
+        ):
+            logger.info("[Orchestrator] 🚧 §4 硬约束：Analysis 已完成但 Refinement 未运行，禁止直接进 Verification")
+            return (
+                "## ⚠️ 流程约束\n\n"
+                "Analysis Agent 已经产出发现，但 Refinement Agent 还未运行。\n"
+                "按照 §4 流程要求，必须先调度 **refinement** 对低置信度发现做二次分析，\n"
+                "才能调度 verification。请立即输出：\n\n"
+                "Action: dispatch_agent\n"
+                "Action Input: {\"agent\": \"refinement\", \"task\": \"对 Analysis 的 findings 做二次分析\"}"
+            )
+
         # 🔥 检查是否重复调度同一个 Agent
         dispatch_count = self._dispatched_tasks.get(agent_name, 0)
         if dispatch_count >= 2:
@@ -821,6 +860,61 @@ Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
                     logger.info(
                         f"[Orchestrator] Saved {agent_name} handoff: "
                         f"summary={result.handoff.summary[:50]}..."
+                    )
+
+                # 🔥 §4: Refinement Agent 的结果是**决策**，不是新发现——
+                # 它决定哪些原有 finding 保留、丢弃或保留待人工确认。因此在这里做
+                # 特殊处理，绕过下面通用的 findings 合并逻辑（否则会把 refined 的
+                # findings 再和 _all_findings 里的原始版本合并一次，达不到"替换"效果）。
+                if agent_name == "refinement":
+                    outbound = data.get("findings", []) or []
+                    dropped = data.get("dropped_findings", []) or []
+                    unclear = data.get("unclear_findings", []) or []
+
+                    # 用 refinement 输出**完全替换** _all_findings 中的活跃发现集合
+                    # （只保留 refinement 认可的：passthrough + confirmed）
+                    replacement = []
+                    for f in outbound:
+                        if isinstance(f, dict):
+                            replacement.append(f)
+                    self._all_findings = replacement
+
+                    # dropped/unclear 单独保存，交给报告端渲染独立分区
+                    self._dropped_findings.extend(d for d in dropped if isinstance(d, dict))
+                    self._unclear_findings.extend(u for u in unclear if isinstance(u, dict))
+
+                    self._refinement_done = True
+
+                    stats = (data.get("refinement_details") or {})
+                    n_pass = len(stats.get("passthrough", []) or [])
+                    n_confirm = len(stats.get("refined_confirmed", []) or [])
+
+                    logger.info(
+                        f"[Orchestrator] Refinement 替换 _all_findings: "
+                        f"passthrough={n_pass}, confirmed={n_confirm}, "
+                        f"dropped={len(self._dropped_findings)}, "
+                        f"unclear={len(self._unclear_findings)}"
+                    )
+
+                    await self.emit_event(
+                        "dispatch_complete",
+                        f"✅ Refinement Agent 完成: 保留 {len(self._all_findings)}, "
+                        f"丢弃 {len(dropped)}, 待人工 {len(unclear)}",
+                        agent=agent_name,
+                        findings_count=len(self._all_findings),
+                    )
+
+                    return (
+                        f"## Refinement Agent 执行结果\n\n"
+                        f"**状态**: 成功\n"
+                        f"**耗时**: {result.duration_ms}ms\n\n"
+                        f"### 精修统计\n"
+                        f"- 直接放行 (高置信度): {n_pass}\n"
+                        f"- 精修后升格 (confirmed): {n_confirm}\n"
+                        f"- 判为误报 / 丢弃: {len(dropped)}\n"
+                        f"- 保留待人工确认: {len(unclear)}\n\n"
+                        f"下一步：调度 **verification** Agent 验证以上 "
+                        f"{len(self._all_findings)} 条 refinement 放行的发现，或使用 finish 结束审计。"
                     )
 
                 # 🔥 CRITICAL FIX: 收集发现 - 支持多种字段名
@@ -1474,6 +1568,47 @@ Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
             return None
 
         # 🔥 优先使用前序 Agent 返回的 handoff
+        # 🔥 §4: Refinement Agent 需要 Analysis 的 handoff（里面装着 key_findings）
+        if target_agent == "refinement":
+            # 优先直接透传 Analysis 的 handoff
+            if "analysis" in self._agent_handoffs:
+                analysis_handoff = self._agent_handoffs["analysis"]
+                logger.info(f"[Orchestrator] Using Analysis's handoff for Refinement Agent")
+                return TaskHandoff(
+                    from_agent=analysis_handoff.from_agent,
+                    to_agent=target_agent,
+                    summary=analysis_handoff.summary,
+                    work_completed=analysis_handoff.work_completed,
+                    # 关键：把 Analysis 的所有 findings 塞过去，Refinement 会自行分桶
+                    key_findings=(self._agent_results.get("analysis") or {}).get("findings", [])
+                        or analysis_handoff.key_findings,
+                    insights=analysis_handoff.insights,
+                    suggested_actions=analysis_handoff.suggested_actions,
+                    attention_points=analysis_handoff.attention_points,
+                    priority_areas=analysis_handoff.priority_areas,
+                    context_data=analysis_handoff.context_data,
+                    confidence=analysis_handoff.confidence,
+                )
+            # 没有 Analysis handoff 但有 _agent_results 也能凑
+            analysis_data = self._agent_results.get("analysis", {}) or {}
+            findings = analysis_data.get("findings", []) or []
+            if findings:
+                return TaskHandoff(
+                    from_agent="Analysis",
+                    to_agent=target_agent,
+                    summary=f"Analysis 产出 {len(findings)} 个发现待精修",
+                    work_completed=[f"Analysis 完成，输出 {len(findings)} 个 findings"],
+                    key_findings=findings,
+                    insights=[],
+                    suggested_actions=[],
+                    attention_points=[],
+                    priority_areas=[],
+                    context_data={},
+                    confidence=0.7,
+                )
+            # 什么都没有，返回 None 让 Refinement 自己去 previous_results 找
+            return None
+
         # Analysis Agent 需要 Recon 的 handoff
         if target_agent == "analysis" and "recon" in self._agent_handoffs:
             recon_handoff = self._agent_handoffs["recon"]
@@ -1491,6 +1626,32 @@ Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
                 priority_areas=recon_handoff.priority_areas,
                 context_data=recon_handoff.context_data,
                 confidence=recon_handoff.confidence,
+            )
+
+        # Verification Agent 需要 Refinement 或 Analysis 的 handoff
+        # 🔥 §4: 优先用 Refinement 的输出（那才是应该被验证的清单）
+        if target_agent == "verification" and "refinement" in self._agent_handoffs:
+            refinement_handoff = self._agent_handoffs["refinement"]
+            logger.info(f"[Orchestrator] Using Refinement's handoff for Verification Agent")
+
+            context_data = dict(refinement_handoff.context_data)
+            if "recon" in self._agent_handoffs:
+                recon_handoff = self._agent_handoffs["recon"]
+                context_data["recon_tech_stack"] = recon_handoff.context_data.get("tech_stack", {})
+                context_data["recon_entry_points"] = recon_handoff.context_data.get("entry_points", [])
+
+            return TaskHandoff(
+                from_agent=refinement_handoff.from_agent,
+                to_agent=target_agent,
+                summary=refinement_handoff.summary,
+                work_completed=refinement_handoff.work_completed,
+                key_findings=refinement_handoff.key_findings,
+                insights=refinement_handoff.insights,
+                suggested_actions=refinement_handoff.suggested_actions,
+                attention_points=refinement_handoff.attention_points,
+                priority_areas=refinement_handoff.priority_areas,
+                context_data=context_data,
+                confidence=refinement_handoff.confidence,
             )
 
         # Verification Agent 需要 Analysis 的 handoff（也可能需要 Recon 的信息）

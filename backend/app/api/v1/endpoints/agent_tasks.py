@@ -241,7 +241,7 @@ async def _execute_agent_task(task_id: str):
     
     架构：OrchestratorAgent 作为大脑，动态调度子 Agent
     """
-    from app.services.agent.agents import OrchestratorAgent, ReconAgent, AnalysisAgent, VerificationAgent
+    from app.services.agent.agents import OrchestratorAgent, ReconAgent, AnalysisAgent, VerificationAgent, RefinementAgent
     from app.services.agent.event_manager import EventManager, AgentEventEmitter
     from app.services.llm.service import LLMService
     from app.services.agent.core import agent_registry
@@ -435,6 +435,13 @@ async def _execute_agent_task(task_id: str):
                 event_emitter=event_emitter,
             )
 
+            # 🔥 §4: Refinement Agent - 对 Analysis 的低置信度发现做二次分析
+            refinement_agent = RefinementAgent(
+                llm_service=llm_service,
+                tools=tools.get("refinement", {}),
+                event_emitter=event_emitter,
+            )
+
             # 创建 Orchestrator Agent
             orchestrator = OrchestratorAgent(
                 llm_service=llm_service,
@@ -443,6 +450,7 @@ async def _execute_agent_task(task_id: str):
                 sub_agents={
                     "recon": recon_agent,
                     "analysis": analysis_agent,
+                    "refinement": refinement_agent,
                     "verification": verification_agent,
                 },
             )
@@ -456,6 +464,7 @@ async def _execute_agent_task(task_id: str):
             # 同时也为子 Agent 设置（虽然 Orchestrator 会传播）
             recon_agent.set_cancel_callback(check_global_cancel)
             analysis_agent.set_cancel_callback(check_global_cancel)
+            refinement_agent.set_cancel_callback(check_global_cancel)
             verification_agent.set_cancel_callback(check_global_cancel)
 
             # 注册到全局
@@ -562,6 +571,23 @@ async def _execute_agent_task(task_id: str):
                 # 🔥 v2.1: 传递 project_root 用于文件路径验证
                 saved_count = await _save_findings(db, task_id, findings, project_root=project_root)
                 logger.info(f"[AgentTask] Saved {saved_count}/{len(findings)} findings (filtered {len(findings) - saved_count} hallucinations)")
+
+                # 🔥 §4: 把 Refinement 的丢弃/待人工分区也持久化，报告端消费
+                dropped_findings = result.data.get("dropped_findings", []) or []
+                unclear_findings = result.data.get("unclear_findings", []) or []
+                if dropped_findings:
+                    # 这些进 DB 时已在 metadata 里带 refinement.verdict 标签，
+                    # _save_findings 会把它们 status 设为 FALSE_POSITIVE
+                    dropped_saved = await _save_findings(
+                        db, task_id, dropped_findings, project_root=project_root
+                    )
+                    logger.info(f"[AgentTask] §4: Saved {dropped_saved} dropped findings (marked FALSE_POSITIVE)")
+                if unclear_findings:
+                    # unclear 也保存，但 status=NEW，metadata 有 refinement.verdict='still_unclear'
+                    unclear_saved = await _save_findings(
+                        db, task_id, unclear_findings, project_root=project_root
+                    )
+                    logger.info(f"[AgentTask] §4: Saved {unclear_saved} unclear findings")
 
                 # 更新任务统计
                 # 🔥 CRITICAL FIX: 在设置完成前再次检查取消状态
@@ -1065,10 +1091,20 @@ async def _initialize_tools(
         "think": ThinkTool(),
         "reflect": ReflectTool(),
     }
-    
+
+    # 🔥 §4: Refinement 工具 —— 只需要读文件 + 搜代码 + 思考。
+    # 精修阶段确定性预取上下文，不需要 SAST / sandbox / RAG 那一整套。
+    refinement_tools = {
+        **base_tools,
+    }
+    if retriever:
+        # RAG 可以作为可选的上下文补充（Refinement 内部不主动调，但工具挂着不吃亏）
+        refinement_tools["rag_query"] = RAGQueryTool(retriever)
+
     return {
         "recon": recon_tools,
         "analysis": analysis_tools,
+        "refinement": refinement_tools,
         "verification": verification_tools,
         "orchestrator": orchestrator_tools,
     }
@@ -1406,6 +1442,19 @@ async def _save_findings(
                 except ValueError:
                     cvss_score = None
 
+            # 🔥 §4: 从 finding_metadata.refinement 决定持久化 status
+            # Refinement 判为 false_positive / auto_dropped_low_confidence 的
+            # 存入 DB 时 status=FALSE_POSITIVE，报告端可以据此过滤或归入"扫描但过滤"分区
+            finding_metadata = finding.get("finding_metadata") or {}
+            refinement_meta = (finding_metadata or {}).get("refinement") or {}
+            refinement_verdict = refinement_meta.get("verdict")
+            if refinement_verdict in ("false_positive", "auto_dropped_low_confidence"):
+                initial_status = FindingStatus.FALSE_POSITIVE
+            elif is_verified:
+                initial_status = FindingStatus.VERIFIED
+            else:
+                initial_status = FindingStatus.NEW
+
             db_finding = AgentFinding(
                 id=str(uuid4()),
                 task_id=task_id,
@@ -1420,7 +1469,7 @@ async def _save_findings(
                 suggestion=suggestion[:5000] if suggestion else None,
                 is_verified=is_verified,
                 ai_confidence=confidence,  # 🔥 FIX: Use ai_confidence, not confidence
-                status=FindingStatus.VERIFIED if is_verified else FindingStatus.NEW,
+                status=initial_status,
                 # 🔥 Additional fields
                 has_poc=has_poc,
                 poc_code=poc_code,
@@ -1431,6 +1480,8 @@ async def _save_findings(
                 cvss_score=cvss_score,
                 # References for CWE
                 references=[{"cwe": cwe_id}] if cwe_id else None,
+                # 🔥 §4: 保留 refinement / source 等标签，报告端要用
+                finding_metadata=finding_metadata or None,
             )
             db.add(db_finding)
             saved_count += 1
@@ -3263,6 +3314,28 @@ async def generate_audit_report(
         )
     )
     findings = findings.scalars().all()
+
+    # 🔥 §4: 按 Refinement 结果切分三类
+    # - active_findings: 正常展示的漏洞（passthrough 高置信度 + refined confirmed + 未经 Refinement 的其他 findings）
+    # - dropped_findings: Refinement 判为误报或 confidence<0.5 直接丢，报告放"扫描但过滤"分区
+    # - unclear_findings: Refinement 拿不准，报告放"待人工确认"分区
+    def _refinement_verdict(f) -> str:
+        meta = f.finding_metadata or {}
+        if not isinstance(meta, dict):
+            return ""
+        r = meta.get("refinement")
+        if not isinstance(r, dict):
+            return ""
+        return str(r.get("verdict") or "").lower()
+
+    dropped_by_refinement = [f for f in findings if _refinement_verdict(f) in ("false_positive", "auto_dropped_low_confidence")]
+    unclear_by_refinement = [f for f in findings if _refinement_verdict(f) == "still_unclear"]
+    dropped_ids = {f.id for f in dropped_by_refinement}
+    unclear_ids = {f.id for f in unclear_by_refinement}
+    active_findings = [f for f in findings if f.id not in dropped_ids and f.id not in unclear_ids]
+
+    # 主报告以 active_findings 为准（原来的 findings 变量向后兼容也换掉）
+    findings = active_findings
     
     # 🔥 Helper function to normalize severity for comparison (case-insensitive)
     def normalize_severity(sev: str) -> str:
@@ -3657,6 +3730,63 @@ async def generate_audit_report(
         if low > 0:
             md_lines.append(f"{priority_idx}. **低优先级:** 在日常维护中处理 {low} 个低危漏洞")
             priority_idx += 1
+        md_lines.append("")
+
+    # 🔥 §4: "待人工确认" 分区 —— Refinement 拿不准的发现
+    if unclear_by_refinement:
+        md_lines.append("## 待人工确认")
+        md_lines.append("")
+        md_lines.append(
+            f"以下 {len(unclear_by_refinement)} 条发现经 Refinement Agent 二次分析后**仍然存疑**，"
+            "既没有足够证据判为漏洞，也无法排除。建议由人工审阅代码上下文后决定是否处理。"
+        )
+        md_lines.append("")
+        for i, f in enumerate(unclear_by_refinement, 1):
+            meta = f.finding_metadata or {}
+            refinement = meta.get("refinement") if isinstance(meta, dict) else {}
+            why = (refinement or {}).get("why", "") if isinstance(refinement, dict) else ""
+            new_conf = (refinement or {}).get("new_confidence") if isinstance(refinement, dict) else None
+
+            loc = f.file_path or "-"
+            if f.line_start:
+                loc = f"{loc}:{f.line_start}"
+
+            md_lines.append(f"### 待确认-{i}: {f.title or 'Unknown'}")
+            md_lines.append("")
+            md_lines.append(f"- **位置:** `{loc}`")
+            md_lines.append(f"- **类型:** `{f.vulnerability_type or 'other'}`")
+            if new_conf is not None:
+                md_lines.append(f"- **Refinement 新置信度:** {new_conf}")
+            if f.description:
+                md_lines.append(f"- **描述:** {f.description[:400]}")
+            if why:
+                md_lines.append(f"- **Refinement 判定理由:** {why[:400]}")
+            md_lines.append("")
+
+    # 🔥 §4: "扫描但过滤" 分区 —— Refinement 判为误报或直接丢弃的
+    if dropped_by_refinement:
+        md_lines.append("## 扫描但过滤 (误报 / 低置信度)")
+        md_lines.append("")
+        md_lines.append(
+            f"以下 {len(dropped_by_refinement)} 条候选发现在 Refinement 阶段被过滤，未进入正式漏洞列表。"
+            "记录在此仅供审计追溯，不代表存在真实漏洞。"
+        )
+        md_lines.append("")
+        md_lines.append("| 位置 | 类型 | 原始置信度 | 过滤理由 |")
+        md_lines.append("|---|---|---|---|")
+        for f in dropped_by_refinement:
+            meta = f.finding_metadata or {}
+            refinement = meta.get("refinement") if isinstance(meta, dict) else {}
+            reason = ""
+            orig_conf = ""
+            if isinstance(refinement, dict):
+                reason = (refinement.get("why") or refinement.get("verdict") or "")
+                orig_conf = str(refinement.get("new_confidence") or f.ai_confidence or "-")
+            reason = str(reason).replace("|", "\\|").replace("\n", " ")[:200]
+            loc = f.file_path or "-"
+            if f.line_start:
+                loc = f"{loc}:{f.line_start}"
+            md_lines.append(f"| `{loc}` | `{f.vulnerability_type or '-'}` | {orig_conf} | {reason or '-'} |")
         md_lines.append("")
 
     # Footer
