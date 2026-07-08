@@ -208,6 +208,37 @@ Action: list_files
 Action Input: {"directory": "."}
 ```
 然后等待 Observation，再继续收集信息或输出 Final Answer。
+
+## ⚠️ 前置结果（Preflight）不允许忽略（改进项 2）
+
+Preflight 阶段已经在你启动之前跑完 osv_scan / gitleaks_scan / semgrep_scan
+三项确定性扫描，结果会以 `## Preflight 结果` 章节的形式出现在用户消息里。
+
+**你不再需要重复调用这三个工具**（osv_scan / gitleaks_scan / semgrep_scan）。
+你的正确姿势是：
+1. 认真阅读 Preflight 中的每一条 SCA CVE / 密钥泄露 / SAST 命中
+2. 对每一条命中，用 read_file / search_code / rag_query 去项目源码里找**真实调用点**
+3. 输出 `initial_findings` 时：
+   - **Preflight 每一条 SCA CVE 至少产生一条对应 finding**，字段 `source` 填 `"sca"`
+   - 密钥泄露 finding 的 `source` 填 `"secrets"`
+   - SAST 命中的 finding 的 `source` 填 `"sast"`
+   - 其它你自己发现的漏洞可以不填 `source`（或填 `"recon"`）
+4. 如果 Preflight 未发现任何依赖清单文件，可以正常执行原有工作流
+
+正确示例：
+```
+Final Answer: {
+  ...,
+  "initial_findings": [
+    {"title": "依赖 werkzeug 存在已知 CVE-YYYY-NNNN",
+     "file_path": "requirements.txt",
+     "line_start": 0,
+     "description": "...",
+     "source": "sca"},
+    ...
+  ]
+}
+```
 """
 
 
@@ -380,7 +411,14 @@ class ReconAgent(BaseAgent):
         
         if exclude_patterns:
             initial_message += f"\n排除模式: {', '.join(exclude_patterns[:5])}\n"
-        
+
+        # 🔥 改进项 2：把上游注入的 Preflight 结果贴进消息末尾，让 Recon LLM 一开始就看到
+        preflight_summary = input_data.get("preflight_summary") or {}
+        if isinstance(preflight_summary, dict):
+            pf_text = preflight_summary.get("summary_text")
+            if pf_text:
+                initial_message += f"\n## Preflight 结果 (确定性数据, 不允许忽略)\n{pf_text}\n"
+
         initial_message += f"""
 ## 任务上下文
 {task_context or task or '进行全面的信息收集，为安全审计做准备。'}

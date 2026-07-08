@@ -484,7 +484,37 @@ async def _execute_agent_task(task_id: str):
             # 更新任务文件统计
             task.total_files = project_info.get("file_count", 0)
             await db.commit()
-            
+
+            # 🔥 改进项 2：Preflight 阶段（SCA + Secrets + SAST 强制前置）
+            # 在把控制权交给 LLM 之前，先跑一次确定性扫描，把已知 CVE / 密钥 / SAST
+            # 命中作为「已知情报」注入下游 Agent。避免 Recon 花大量 token 从零手翻
+            # 依赖清单。见 deepaudit修改文档.md §2。
+            preflight_summary: Dict[str, Any] = {}
+            try:
+                from app.services.agent.stages import run_preflight
+
+                task.current_phase = AgentTaskPhase.RECONNAISSANCE
+                await db.commit()
+
+                preflight_summary = await run_preflight(
+                    project_root=project_root,
+                    sandbox_manager=sandbox_manager,
+                    event_emitter=event_emitter,
+                    task_id=task_id,
+                )
+                logger.info(
+                    f"[preflight] task={task_id} "
+                    f"has_manifest={preflight_summary.get('has_manifest')} "
+                    f"sca={preflight_summary.get('sca', {}).get('count', 0)} "
+                    f"secrets={preflight_summary.get('secrets', {}).get('count', 0)} "
+                    f"sast={preflight_summary.get('sast', {}).get('count', 0)}"
+                )
+            except Exception as e:  # noqa: BLE001
+                # preflight 失败不阻断主流程 —— 记 warning，后续 Agent 照旧
+                logger.warning(f"[preflight] 执行异常，将跳过前置扫描: {e}", exc_info=True)
+                await event_emitter.emit_warning(f"⚠️ Preflight 前置扫描异常，已跳过: {e}")
+                preflight_summary = {}
+
             # 构建输入数据
             input_data = {
                 "project_info": project_info,
@@ -497,6 +527,7 @@ async def _execute_agent_task(task_id: str):
                 },
                 "project_root": project_root,
                 "task_id": task_id,
+                "preflight_summary": preflight_summary,  # 🔥 改进项 2
             }
             
             # 执行 Orchestrator

@@ -210,6 +210,8 @@ class OrchestratorAgent(BaseAgent):
             "config": config,
             "project_root": input_data.get("project_root", project_info.get("root", ".")),
             "task_id": input_data.get("task_id"),
+            # 🔥 改进项 2：前置扫描结果（SCA/Secrets/SAST），由 _execute_agent_task 注入
+            "preflight_summary": input_data.get("preflight_summary") or {},
         }
         
         # 构建初始消息
@@ -581,7 +583,21 @@ Action Input: {{"参数": "值"}}
 
 ## 可用子 Agent
 {', '.join(self.sub_agents.keys()) if self.sub_agents else '(暂无子 Agent)'}
+"""
 
+        # 🔥 改进项 2：把 Preflight 结果贴进初始消息，让 LLM 一开始就看到已知情报
+        preflight = getattr(self, "_runtime_context", {}).get("preflight_summary") or {}
+        pf_text = preflight.get("summary_text") if isinstance(preflight, dict) else None
+        if pf_text:
+            msg += f"""
+## 前置扫描结果 (Preflight, 确定性数据, 不允许忽略)
+{pf_text}
+
+调度 Recon Agent 时，请把 Preflight 结果一并放到 context 里；调度 Analysis
+Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
+"""
+
+        msg += """
 请开始你的审计工作。首先思考应该如何开展，然后决定第一步做什么。"""
         
         return msg
@@ -710,6 +726,8 @@ Action Input: {{"参数": "值"}}
                 "project_root": self._runtime_context.get("project_root", "."),
                 "previous_results": previous_results,
                 "handoff": handoff.to_dict() if handoff else None,  # 🔥 传递 TaskHandoff
+                # 🔥 改进项 2：把前置扫描结果透传给子 Agent
+                "preflight_summary": self._runtime_context.get("preflight_summary") or {},
             }
 
             # 🔥 执行子 Agent 前检查取消状态
@@ -999,6 +1017,12 @@ Action Input: {{"参数": "值"}}
                     logger.info(f"[Orchestrator] Total findings now: {len(self._all_findings)}")
                 else:
                     logger.info(f"[Orchestrator] {agent_name} returned no findings")
+
+                # 🔥 改进项 2：如果 Recon 结果里一条都没标 source=sca/secrets/sast，
+                # 但 Preflight 明明命中了东西，就把 Preflight 的原始条目合成 finding 补进去，
+                # 防止 Recon 忽视前置结果导致漏报。见 deepaudit修改文档.md §2 改动 C。
+                if agent_name == "recon":
+                    self._inject_preflight_findings_if_missing()
                 
                 await self.emit_event(
                     "dispatch_complete",
@@ -1110,6 +1134,140 @@ Action Input: {{"参数": "值"}}
 
         return False
 
+    # ------------------------------------------------------------------
+    # 改进项 2：Preflight 兜底注入
+    # 目的：即便 Recon Agent 忽视了 preflight_summary，也不要让已知 CVE / 密钥 /
+    # SAST 命中在最终报告里凭空消失。见 deepaudit修改文档.md §2 改动 C。
+    # ------------------------------------------------------------------
+    def _inject_preflight_findings_if_missing(self) -> None:
+        preflight = (self._runtime_context or {}).get("preflight_summary") or {}
+        if not isinstance(preflight, dict):
+            return
+
+        sca_vulns = (preflight.get("sca") or {}).get("vulnerabilities") or []
+        secrets_leaks = (preflight.get("secrets") or {}).get("leaks") or []
+        sast_findings = (preflight.get("sast") or {}).get("findings") or []
+
+        if not (sca_vulns or secrets_leaks or sast_findings):
+            return
+
+        # 已经有 Recon 打了 source 标签的话，视为 Recon 尊重了前置结果，不重复注入
+        already_tagged = any(
+            (f.get("source") in ("sca", "secrets", "sast"))
+            or ((f.get("finding_metadata") or {}).get("source") in ("sca", "secrets", "sast"))
+            for f in self._all_findings
+            if isinstance(f, dict)
+        )
+        if already_tagged:
+            logger.info("[Orchestrator] Preflight findings already reflected by Recon, skip inject")
+            return
+
+        manifests = preflight.get("manifests") or []
+        default_manifest = manifests[0] if manifests else ""
+
+        synthesized = self._synthesize_preflight_findings(
+            sca_vulns=sca_vulns,
+            secrets_leaks=secrets_leaks,
+            sast_findings=sast_findings,
+            manifest_hint=default_manifest,
+        )
+        if not synthesized:
+            return
+
+        # 走一次 normalize，保证字段格式与其他 finding 对齐（不做 _validate_file_path
+        # 因为 SCA 命中的 "文件" 是 manifest，可能在项目里存在也可能不存在）
+        added = 0
+        for f in synthesized:
+            # 直接落入 self._all_findings，跳过 file_path 校验（SCA 的 file_path 天然不是源码路径）
+            self._all_findings.append(f)
+            added += 1
+        logger.info(f"[Orchestrator] 🩹 Preflight 兜底注入 {added} 条 finding（Recon 未消费前置结果）")
+
+    def _synthesize_preflight_findings(
+        self,
+        sca_vulns: List[Dict[str, Any]],
+        secrets_leaks: List[Dict[str, Any]],
+        sast_findings: List[Dict[str, Any]],
+        manifest_hint: str = "",
+    ) -> List[Dict[str, Any]]:
+        """把 preflight 的原始条目合成标准 finding dict。"""
+        out: List[Dict[str, Any]] = []
+
+        # --- SCA CVEs ---
+        for v in sca_vulns:
+            vid = v.get("id") or "UNKNOWN-CVE"
+            out.append({
+                "title": f"[SCA] 依赖组件已知漏洞 {vid}",
+                "vulnerability_type": "vulnerable_dependency",
+                "severity": "high",  # OSV 命中默认按 high 处理，Analysis 可细化
+                "file_path": manifest_hint or "requirements.txt",
+                "line_start": 0,
+                "description": (
+                    f"OSV-Scanner 在项目依赖清单中命中 {vid}。"
+                    "该漏洞由 Preflight 前置扫描确定性发现，不依赖 LLM 判断。"
+                ),
+                "source": "sca",
+                "is_verified": True,  # 权威源即视为已确认
+                "confidence": 0.95,
+                "finding_metadata": {
+                    "source": "sca",
+                    "cve_id": vid,
+                    "engine": "osv-scanner",
+                },
+            })
+
+        # --- Gitleaks ---
+        for leak in secrets_leaks:
+            rule = leak.get("rule") or "unknown-rule"
+            fp = leak.get("file") or ""
+            line = leak.get("line") or 0
+            out.append({
+                "title": f"[Secrets] 密钥泄露 {rule}",
+                "vulnerability_type": "hardcoded_secret",
+                "severity": "high",
+                "file_path": fp,
+                "line_start": line,
+                "description": (
+                    f"Gitleaks 在 {fp}:{line} 命中密钥规则 {rule}。"
+                    "由 Preflight 前置扫描确定性发现。"
+                ),
+                "source": "secrets",
+                "is_verified": True,
+                "confidence": 0.9,
+                "finding_metadata": {
+                    "source": "secrets",
+                    "rule": rule,
+                    "engine": "gitleaks",
+                },
+            })
+
+        # --- Semgrep ---
+        for sf in sast_findings:
+            check_id = sf.get("check_id") or "semgrep-rule"
+            fp = sf.get("path") or ""
+            line = sf.get("line") or 0
+            sev = (sf.get("severity") or "medium").lower()
+            # semgrep 的 ERROR/WARNING/INFO → high/medium/low
+            severity = {"error": "high", "warning": "medium", "info": "low"}.get(sev, "medium")
+            out.append({
+                "title": f"[SAST] {check_id}",
+                "vulnerability_type": "other",
+                "severity": severity,
+                "file_path": fp,
+                "line_start": line,
+                "description": (sf.get("message") or f"Semgrep 规则 {check_id} 命中")[:500],
+                "source": "sast",
+                "is_verified": False,  # SAST 需要 Agent 复核可达性
+                "confidence": 0.6,
+                "finding_metadata": {
+                    "source": "sast",
+                    "check_id": check_id,
+                    "engine": "semgrep",
+                },
+            })
+
+        return out
+
     def _normalize_finding(self, finding: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         标准化发现格式
@@ -1198,7 +1356,23 @@ Action Input: {{"参数": "值"}}
             if "impact" not in normalized["description"].lower():
                 normalized["description"] += f"\n\nImpact: {normalized['impact']}"
 
+        # 🔥 改进项 2：保留 source 标签到 finding_metadata，供报告端区分来源
+        # 不覆盖已有 metadata，仅在缺失时补齐。
+        src = normalized.get("source")
+        if src:
+            meta = normalized.get("finding_metadata")
+            if not isinstance(meta, dict):
+                meta = {}
+            meta.setdefault("source", src)
+            normalized["finding_metadata"] = meta
+
         # 🔥 v2.1: 验证文件路径存在性
+        # 🔥 改进项 2 例外：source=sca 的 finding 引用的是 manifest 文件（可能是
+        # 相对根目录的路径），且即便文件不在也不应丢弃——它是权威 CVE 报告
+        source_tag = (normalized.get("finding_metadata") or {}).get("source") or normalized.get("source")
+        if source_tag == "sca":
+            return normalized
+
         file_path = normalized.get("file_path", "")
         if file_path and not self._validate_file_path(file_path):
             logger.warning(
