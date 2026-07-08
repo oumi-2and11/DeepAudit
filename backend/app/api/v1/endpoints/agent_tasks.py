@@ -1011,6 +1011,8 @@ async def _initialize_tools(
         # 多语言代码测试工具
         PhpTestTool, PythonTestTool, JavaScriptTestTool, JavaTestTool,
         GoTestTool, RubyTestTool, ShellTestTool, UniversalCodeTestTool,
+        # 🔥 C / C++ 动态验证工具链 (§3)
+        CTestTool, CppTestTool, FuzzTestTool,
         # 漏洞验证专用工具
         CommandInjectionTestTool, SqlInjectionTestTool, XssTestTool,
         PathTraversalTestTool, SstiTestTool, DeserializationTestTool,
@@ -1035,6 +1037,11 @@ async def _initialize_tools(
         "ruby_test": RubyTestTool(sandbox_manager, project_root),
         "shell_test": ShellTestTool(sandbox_manager, project_root),
         "universal_code_test": UniversalCodeTestTool(sandbox_manager, project_root),
+
+        # 🔥 C / C++ 动态验证 (§3 修改方案)
+        "c_test": CTestTool(sandbox_manager, project_root),
+        "cpp_test": CppTestTool(sandbox_manager, project_root),
+        "fuzz_test": FuzzTestTool(sandbox_manager, project_root),
 
         # 🔥 漏洞验证专用工具
         "test_command_injection": CommandInjectionTestTool(sandbox_manager, project_root),

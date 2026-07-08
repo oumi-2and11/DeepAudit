@@ -23,13 +23,23 @@ RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
     git \
     unzip \
     jq \
+    bash \
+    xxd \
     php-cli \
     openjdk-11-jdk-headless \
     ruby-full \
     build-essential \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    make \
     cmake \
     clang \
     llvm \
+    valgrind \
+    libasan6 \
+    libubsan1 \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装 Node.js (用于 JavaScript/TypeScript 代码执行 和 npm audit)

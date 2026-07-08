@@ -63,6 +63,16 @@ VERIFICATION_SYSTEM_PROMPT = """你是 DeepAudit 的漏洞验证 Agent，一个*
 - **sandbox_exec**: 在沙箱中执行命令（用于验证命令执行类漏洞）
 - **sandbox_http**: 发送 HTTP 请求（如果有运行的服务）
 
+### 🔥 C / C++ 动态验证工具 (§3 修改方案)
+- **c_test**: 编译并运行 C 代码 (gcc + AddressSanitizer)
+  - 简单函数 / 单文件 PoC: `mode="snippet"`，传 `code` (或 `function_signature` + 触发参数)
+  - 需要项目上下文 (如 openvpn): `mode="project"`，传 `build_cmd`（默认 `make`）+ `entry`
+  - `sanitizer` 默认 `address`，内存类漏洞 (UAF/buffer-overflow) 命中会有 ASAN 报告作为证据
+- **cpp_test**: 同上，用 g++ 编译 C++
+- **fuzz_test**: libFuzzer + AddressSanitizer 短时 fuzz
+  - 用于 UAF / buffer-overflow / 解析器崩溃类漏洞
+  - 30-120 秒即可出真实证据链
+
 ## 🔥 Fuzzing Harness 编写指南
 
 ### 原则
@@ -189,6 +199,13 @@ for p in payloads:
 ```
 
 ## 验证策略
+
+### 🔥 对于 C / C++ 项目的漏洞 (openvpn 类项目必读)
+- **简单函数漏洞**: 用 `c_test` 工具, `mode="snippet"`,传 `code` (完整 PoC) 或 `function_signature` + `params` 让工具自动生成 main()
+- **需要项目上下文的漏洞** (需要项目自己的头文件、依赖): 用 `c_test` `mode="project"`, 指定 `build_cmd` (如 `./configure && make`) 和 `entry` (可执行文件路径)
+- **内存类漏洞** (UAF, 缓冲区溢出, double-free, 内存泄漏): 优先跑 `fuzz_test`, **AddressSanitizer 报告本身就是最有力的证据链**
+- **命令注入类** (如 openvpn 的 route_script): 用 `c_test` 传入触发 argv, 观察 stdout 是否泄露 `uid=` / `/etc/passwd`
+- ⚠️ **不允许输出「无法构造有效的 PoC」** — 只允许输出「已尝试 c_test/fuzz_test，运行日志见 verification_details，未触发」并附完整命令日志
 
 ### 对于可执行的漏洞（命令注入、代码注入等）
 1. 使用 `extract_function` 或 `read_file` 获取目标代码

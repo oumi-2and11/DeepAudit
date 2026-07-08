@@ -20,6 +20,12 @@ echo "Build complete: ${IMAGE_NAME}:${IMAGE_TAG}"
 echo "Verifying image..."
 docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" python3 --version
 docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" node --version
+# 🔥 §3 修改方案: C/C++ 动态验证工具链自检
+docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" gcc --version | head -1
+docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" g++ --version | head -1
+docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" clang --version | head -1
+docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" cmake --version | head -1
+docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" valgrind --version
 
 echo "Sandbox image ready!"
 

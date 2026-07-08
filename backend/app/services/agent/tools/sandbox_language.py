@@ -1062,7 +1062,7 @@ class ShellTestTool(BaseLanguageTestTool):
 
 class UniversalCodeTestInput(BaseModel):
     """通用代码测试输入"""
-    language: str = Field(..., description="编程语言: php, python, javascript, java, go, ruby, shell")
+    language: str = Field(..., description="编程语言: php, python, javascript, java, go, ruby, shell, c, cpp")
     code: Optional[str] = Field(default=None, description="要执行的代码")
     file_path: Optional[str] = Field(default=None, description="文件路径")
     params: Optional[Dict[str, str]] = Field(default=None, description="模拟参数")
@@ -1079,6 +1079,9 @@ class UniversalCodeTestTool(AgentTool):
         self.project_root = project_root
 
         # 初始化所有语言测试器
+        # 🔥 C/C++ 在 sandbox_c.py 中实现，此处延迟导入避免循环依赖
+        from .sandbox_c import CTestTool, CppTestTool
+
         self._testers = {
             "php": PhpTestTool(sandbox_manager, project_root),
             "python": PythonTestTool(sandbox_manager, project_root),
@@ -1092,6 +1095,11 @@ class UniversalCodeTestTool(AgentTool):
             "rb": RubyTestTool(sandbox_manager, project_root),
             "shell": ShellTestTool(sandbox_manager, project_root),
             "bash": ShellTestTool(sandbox_manager, project_root),
+            # 🔥 C / C++ (§3 修改方案)
+            "c": CTestTool(sandbox_manager, project_root),
+            "cpp": CppTestTool(sandbox_manager, project_root),
+            "c++": CppTestTool(sandbox_manager, project_root),
+            "cc": CppTestTool(sandbox_manager, project_root),
         }
 
     @property
@@ -1100,12 +1108,13 @@ class UniversalCodeTestTool(AgentTool):
 
     @property
     def description(self) -> str:
-        return """通用多语言代码测试工具，支持 PHP, Python, JavaScript, Java, Go, Ruby, Shell。
+        return """通用多语言代码测试工具，支持 PHP, Python, JavaScript, Java, Go, Ruby, Shell, C, C++。
 
 自动根据语言选择合适的测试环境，支持各种框架的请求模拟。
+对 C/C++ 会走 gcc/g++ 编译 + AddressSanitizer，可传 mode="project" 让沙箱在只读挂载的项目源码里 configure+make。
 
 输入:
-- language: 编程语言 (php, python, javascript, java, go, ruby, shell)
+- language: 编程语言 (php, python, javascript, java, go, ruby, shell, c, cpp)
 - code: 代码内容（与 file_path 二选一）
 - file_path: 文件路径
 - params: 模拟参数
@@ -1115,7 +1124,8 @@ class UniversalCodeTestTool(AgentTool):
 示例:
 1. PHP: {"language": "php", "file_path": "vuln.php", "params": {"cmd": "id"}}
 2. Python Flask: {"language": "python", "code": "os.system(request.args.get('cmd'))", "params": {"cmd": "whoami"}, "framework_mode": "flask"}
-3. Node.js: {"language": "javascript", "code": "require('child_process').execSync(req.query.cmd)", "params": {"cmd": "id"}, "framework_mode": "express"}"""
+3. Node.js: {"language": "javascript", "code": "require('child_process').execSync(req.query.cmd)", "params": {"cmd": "id"}, "framework_mode": "express"}
+4. C 内存越界 PoC: {"language": "c", "code": "#include<string.h>\\nint main(){char b[8];strcpy(b,\\"AAAAAAAAAAAAAAAAAAAA\\");return 0;}"}"""
 
     @property
     def args_schema(self):

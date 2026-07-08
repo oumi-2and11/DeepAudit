@@ -34,6 +34,13 @@ from .sandbox_language import (
     UniversalCodeTestTool,
 )
 
+# 🔥 C / C++ 动态验证工具链 (§3 修改方案)
+from .sandbox_c import (
+    CTestTool,
+    CppTestTool,
+    FuzzTestTool,
+)
+
 # 🔥 漏洞验证专用工具
 from .sandbox_vuln import (
     CommandInjectionTestTool,
@@ -121,6 +128,11 @@ __all__ = [
     "RubyTestTool",
     "ShellTestTool",
     "UniversalCodeTestTool",
+
+    # 🔥 C / C++ 动态验证工具链
+    "CTestTool",
+    "CppTestTool",
+    "FuzzTestTool",
 
     # 🔥 漏洞验证专用工具
     "CommandInjectionTestTool",
