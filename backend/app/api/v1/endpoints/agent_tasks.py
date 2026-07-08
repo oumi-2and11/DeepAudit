@@ -3410,6 +3410,77 @@ async def generate_audit_report(
         md_lines.append(f"- **生成的 PoC:** {with_poc}")
     md_lines.append("")
 
+    # 🔥 改进项 2：Preflight 前置扫描汇总（SCA / Secrets / SAST）
+    # 按 finding_metadata.source 过滤，独立成段以便评审时和 Agent 手工发现的问题区分。
+    def _source_of(finding) -> str:
+        meta = finding.finding_metadata or {}
+        if isinstance(meta, dict):
+            return str(meta.get("source") or "").lower()
+        return ""
+
+    sca_findings = [f for f in findings if _source_of(f) == "sca"]
+    secrets_findings = [f for f in findings if _source_of(f) == "secrets"]
+    sast_findings = [f for f in findings if _source_of(f) == "sast"]
+
+    if sca_findings or secrets_findings or sast_findings:
+        md_lines.append("## 前置扫描汇总 (Preflight)")
+        md_lines.append("")
+        md_lines.append(
+            "以下条目由 Preflight 阶段确定性扫描器（OSV-Scanner / Gitleaks / Semgrep）"
+            "直接命中，独立于 Agent 的推理判断。详情见下方按严重度分组的漏洞详情。"
+        )
+        md_lines.append("")
+
+        # --- SCA (依赖组件已知漏洞) ---
+        if sca_findings:
+            md_lines.append(f"### 依赖组件安全 (SCA) — 命中 {len(sca_findings)} 条")
+            md_lines.append("")
+            md_lines.append("| CVE / GHSA ID | 严重度 | 位置 | 说明 |")
+            md_lines.append("|---|---|---|---|")
+            for f in sca_findings:
+                meta = f.finding_metadata or {}
+                cve_id = (meta.get("cve_id") if isinstance(meta, dict) else None) or "-"
+                sev = (f.severity or "-").upper()
+                loc = f.file_path or "-"
+                # 描述取首行，避免表格被换行撑破
+                desc = (f.description or "").splitlines()[0][:80] if f.description else "-"
+                # 表格单元里禁用 | 和换行
+                desc = desc.replace("|", "\\|")
+                md_lines.append(f"| `{cve_id}` | {sev} | `{loc}` | {desc} |")
+            md_lines.append("")
+
+        # --- Secrets ---
+        if secrets_findings:
+            md_lines.append(f"### 密钥泄露 (Secrets) — 命中 {len(secrets_findings)} 条")
+            md_lines.append("")
+            md_lines.append("| 规则 | 严重度 | 位置 |")
+            md_lines.append("|---|---|---|")
+            for f in secrets_findings:
+                meta = f.finding_metadata or {}
+                rule = (meta.get("rule") if isinstance(meta, dict) else None) or "-"
+                sev = (f.severity or "-").upper()
+                loc = f.file_path or "-"
+                if f.line_start:
+                    loc = f"{loc}:{f.line_start}"
+                md_lines.append(f"| `{rule}` | {sev} | `{loc}` |")
+            md_lines.append("")
+
+        # --- SAST ---
+        if sast_findings:
+            md_lines.append(f"### 静态分析 (SAST) — 命中 {len(sast_findings)} 条")
+            md_lines.append("")
+            md_lines.append("| 规则 | 严重度 | 位置 |")
+            md_lines.append("|---|---|---|")
+            for f in sast_findings:
+                meta = f.finding_metadata or {}
+                check_id = (meta.get("check_id") if isinstance(meta, dict) else None) or "-"
+                sev = (f.severity or "-").upper()
+                loc = f.file_path or "-"
+                if f.line_start:
+                    loc = f"{loc}:{f.line_start}"
+                md_lines.append(f"| `{check_id}` | {sev} | `{loc}` |")
+            md_lines.append("")
+
     # Detailed Findings
     if not findings:
         md_lines.append("## 漏洞详情")
