@@ -24,6 +24,7 @@ from app.services.zip_storage import (
     save_project_zip, load_project_zip, get_project_zip_meta,
     delete_project_zip, has_project_zip
 )
+from app.utils.repo_utils import parse_repository_url
 
 router = APIRouter()
 
@@ -92,18 +93,51 @@ async def create_project(
 ) -> Any:
     """
     Create new project.
+
+    URL 深度解析（自研增强）：
+    如果 source_type='repository' 且 repository_url 里携带了 ref 信息
+    （例如 /tree/2.0.0、/tree/<commit>、/releases/tag/v1.0、/blob/<ref>/...
+    /commit/<sha> 等），会自动把该 ref 作为项目的默认分支/tag 锚定，同时把
+    repository_url 归一化为仓库根 URL，避免后续所有 API 调用带上多余路径导致
+    404。只在**客户端没有显式提供** default_branch（或提供的值是隐式默认
+    "main"）时才应用；这样保持向后兼容：显式传 branch 的老客户端行为不变。
     """
     import json
     # 根据 source_type 设置默认值
     source_type = project_in.source_type or "repository"
-    
+    repo_type_norm = (project_in.repository_type or "other") if source_type == "repository" else "other"
+
+    # 关于 URL 里携带的 ref 与表单里的 default_branch 谁优先：
+    # 前端表单默认会把 default_branch 初始化为 "main"，所以单纯用 model_fields_set
+    # 无法判断用户是否是"故意选了 main"。这里采取更贴近用户直觉的策略——
+    # 只有当表单里的分支是明显的"占位默认值"（未填、main、master、HEAD）时，
+    # 才让 URL 里显式写出的 ref 覆盖它；其余情况一律以表单为准。
+    _IMPLICIT_BRANCH_SENTINELS = {"", "main", "master", "head", "default"}
+    submitted_branch = (project_in.default_branch or "").strip()
+    branch_is_implicit = submitted_branch.lower() in _IMPLICIT_BRANCH_SENTINELS
+
+    normalized_repo_url = project_in.repository_url
+    resolved_branch = submitted_branch or "main"
+
+    if source_type == "repository" and project_in.repository_url and repo_type_norm in ("github", "gitlab", "gitea"):
+        try:
+            info = parse_repository_url(project_in.repository_url, repo_type_norm)
+            # 归一化：始终把 repository_url 存成仓库根，便于后续接口稳定拼路径
+            normalized_repo_url = info.get("canonical_url") or project_in.repository_url
+            url_ref = info.get("ref")
+            if url_ref and branch_is_implicit:
+                resolved_branch = url_ref
+        except ValueError:
+            # 保留原始 URL；创建接口不因为解析失败就阻断（后续扫描会再校验）
+            normalized_repo_url = project_in.repository_url
+
     project = Project(
         name=project_in.name,
         source_type=source_type,
-        repository_url=project_in.repository_url if source_type == "repository" else None,
-        repository_type=project_in.repository_type or "other" if source_type == "repository" else "other",
+        repository_url=normalized_repo_url if source_type == "repository" else None,
+        repository_type=repo_type_norm,
         description=project_in.description,
-        default_branch=project_in.default_branch or "main",
+        default_branch=resolved_branch,
         programming_languages=json.dumps(project_in.programming_languages or []),
         owner_id=current_user.id
     )

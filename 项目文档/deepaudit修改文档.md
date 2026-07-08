@@ -361,7 +361,7 @@ class EvidenceChain(BaseModel):
    ```c
    line 120 ...
    ...
-   ```
+```
 
 **2) 调用路径**
 `main → parse_arg → foo → system`（3 跳）

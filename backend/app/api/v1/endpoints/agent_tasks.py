@@ -2521,7 +2521,10 @@ async def _get_project_root(
                 # 构建 ZIP 下载 URL
                 if repo_type == "github" or "github.com" in repo_url:
                     # GitHub ZIP 下载 URL
-                    zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.zip"
+                    # 注意：/archive/refs/heads/<ref>.zip 只适用于分支，对 tag 会 404。
+                    # /archive/<ref>.zip 走 GitHub 通用归档端点，支持分支/tag/commit sha，
+                    # 服务端会自动 302 重定向到正确的 codeload URL。
+                    zip_url = f"https://github.com/{owner}/{repo}/archive/{branch}.zip"
                     headers = {}
                     if github_token:
                         headers["Authorization"] = f"token {github_token}"
