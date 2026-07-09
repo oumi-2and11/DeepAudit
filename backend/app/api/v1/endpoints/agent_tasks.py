@@ -1227,6 +1227,31 @@ async def _collect_project_info(
     return info
 
 
+# 🔥 §5: 从 DB 行反向构造 evidence_chain dict，用于历史数据/未预抽情况
+def _build_evidence_chain_from_db_row(row) -> Dict[str, Any]:
+    """
+    给一个 AgentFinding ORM row，抽出 evidence_chain dict。
+
+    只用 row 上的字段——不再回查其它表。给 JSON 报告和历史数据的兜底路径用；
+    正常路径应该由 _save_findings 阶段就把 evidence_chain 塞进 finding_metadata。
+    """
+    try:
+        from app.services.agent.evidence_chain import EvidenceChain
+        proxy = {
+            "file_path": row.file_path,
+            "line_start": row.line_start,
+            "line_end": row.line_end,
+            "code_snippet": row.code_snippet,
+            "verification_method": row.verification_method,
+            "verification_result": row.verification_result if isinstance(row.verification_result, dict) else ({"details": row.verification_result} if row.verification_result else None),
+            "is_verified": row.is_verified,
+            "references": row.references if isinstance(row.references, list) else None,
+        }
+        return EvidenceChain.from_finding(proxy).to_dict()
+    except Exception:
+        return {}
+
+
 async def _save_findings(
     db: AsyncSession,
     task_id: str,
@@ -1432,6 +1457,11 @@ async def _save_findings(
             verification_result = None
             if finding.get("verification_details"):
                 verification_result = {"details": finding.get("verification_details")}
+            # Agent 有时会直接输出 verification_result 结构（command/output/exit_code）
+            if isinstance(finding.get("verification_result"), dict):
+                merged_vr = dict(verification_result or {})
+                merged_vr.update(finding["verification_result"])
+                verification_result = merged_vr
 
             # 🔥 Handle CWE and CVSS
             cwe_id = finding.get("cwe_id") or finding.get("cwe")
@@ -1454,6 +1484,18 @@ async def _save_findings(
                 initial_status = FindingStatus.VERIFIED
             else:
                 initial_status = FindingStatus.NEW
+
+            # 🔥 §5: 抽出证据链（source_locations / call_path / taint_flow / verification / references），
+            # 落到 finding_metadata.evidence_chain 里，报告端直接读。不改 DB schema。
+            try:
+                from app.services.agent.evidence_chain import EvidenceChain
+                ec = EvidenceChain.from_finding(finding)
+                if not isinstance(finding_metadata, dict):
+                    finding_metadata = {}
+                finding_metadata = dict(finding_metadata)  # 别改到 raw finding
+                finding_metadata["evidence_chain"] = ec.to_dict()
+            except Exception as e:
+                logger.debug(f"[SaveFindings] EvidenceChain 抽取失败（不影响主流程）: {e}")
 
             db_finding = AgentFinding(
                 id=str(uuid4()),
@@ -3395,6 +3437,12 @@ async def generate_audit_report(
                     "suggestion": f.suggestion,
                     "fix_code": f.fix_code,
                     "created_at": f.created_at.isoformat() if f.created_at else None,
+                    # 🔥 §5: 完整证据链（预抽 or 现抽）
+                    "evidence_chain": (
+                        (f.finding_metadata or {}).get("evidence_chain")
+                        if isinstance(f.finding_metadata, dict) and (f.finding_metadata or {}).get("evidence_chain")
+                        else _build_evidence_chain_from_db_row(f)
+                    ),
                 } for f in findings
             ]
         }
@@ -3488,6 +3536,35 @@ async def generate_audit_report(
     md_lines.append(f"- **Token 消耗:** {task.tokens_used:,}")
     if with_poc > 0:
         md_lines.append(f"- **生成的 PoC:** {with_poc}")
+
+    # 🔥 §5: 证据链完整度统计
+    # 每条 active finding 都应该有 5/5 段证据；这里汇总"平均完整度"给评审
+    # 一眼看到本次审计的证据链质量
+    if findings:
+        ec_scores = []
+        for f in findings:
+            fmeta = f.finding_metadata if isinstance(f.finding_metadata, dict) else {}
+            ec_dict = (fmeta or {}).get("evidence_chain") or {}
+            comp = ec_dict.get("completeness") if isinstance(ec_dict, dict) else None
+            if isinstance(comp, dict):
+                ec_scores.append(sum(1 for v in comp.values() if v))
+            else:
+                # 老数据兜底：现抽一次
+                try:
+                    ec_scores.append(len([
+                        1 for v in _build_evidence_chain_from_db_row(f).get("completeness", {}).values()
+                        if v
+                    ]))
+                except Exception:
+                    ec_scores.append(0)
+        if ec_scores:
+            avg = sum(ec_scores) / len(ec_scores)
+            full = sum(1 for s in ec_scores if s >= 5)
+            missing = sum(1 for s in ec_scores if s < 3)
+            md_lines.append(
+                f"- **证据链完整度:** 平均 {avg:.1f}/5 "
+                f"(完整 {full} 条 · 严重不足 <3/5 {missing} 条)"
+            )
     md_lines.append("")
 
     # 🔥 改进项 2：Preflight 前置扫描汇总（SCA / Secrets / SAST）
@@ -3707,6 +3784,60 @@ async def generate_audit_report(
                         md_lines.append(f.poc_code.strip())
                         md_lines.append("```")
                         md_lines.append("")
+
+                # 🔥 §5: 证据链面板（source_locations / call_path / taint_flow / verification / references）
+                # 从 finding_metadata.evidence_chain 里读；如果 metadata 里没有，就当场从 DB row 抽一次。
+                md_lines.append("**证据链:**")
+                md_lines.append("")
+                try:
+                    from app.services.agent.evidence_chain import EvidenceChain
+                    fmeta = f.finding_metadata if isinstance(f.finding_metadata, dict) else {}
+                    ec_dict = (fmeta or {}).get("evidence_chain")
+                    if ec_dict:
+                        # 已经预抽好了，直接渲染
+                        ec = EvidenceChain(
+                            source_locations=[],
+                            call_path=[],
+                            taint_flow=ec_dict.get("taint_flow", ""),
+                            references=[],
+                        )
+                        # 用抽好的 dict 直接走 from_finding 合成一次，保证渲染逻辑统一
+                        proxy_finding = {
+                            "file_path": f.file_path,
+                            "line_start": f.line_start,
+                            "line_end": f.line_end,
+                            "code_snippet": f.code_snippet,
+                            "call_path": ec_dict.get("call_path", []),
+                            "taint_flow": ec_dict.get("taint_flow", ""),
+                            "verification_method": (ec_dict.get("verification") or {}).get("method", ""),
+                            "verification_details": (ec_dict.get("verification") or {}).get("output", ""),
+                            "verification_result": {
+                                "command": (ec_dict.get("verification") or {}).get("command", ""),
+                                "output": (ec_dict.get("verification") or {}).get("output", ""),
+                                "exit_code": (ec_dict.get("verification") or {}).get("exit_code"),
+                            },
+                            "verdict": (ec_dict.get("verification") or {}).get("verdict", ""),
+                            "is_verified": f.is_verified,
+                            "references": ec_dict.get("references", []),
+                        }
+                        ec = EvidenceChain.from_finding(proxy_finding)
+                    else:
+                        # 没预抽——从 DB 行现构，保证老数据也能显示
+                        proxy_finding = {
+                            "file_path": f.file_path,
+                            "line_start": f.line_start,
+                            "line_end": f.line_end,
+                            "code_snippet": f.code_snippet,
+                            "verification_method": f.verification_method,
+                            "verification_result": f.verification_result if isinstance(f.verification_result, dict) else {"details": f.verification_result},
+                            "is_verified": f.is_verified,
+                        }
+                        ec = EvidenceChain.from_finding(proxy_finding)
+                    md_lines.append(ec.to_markdown())
+                except Exception as ec_err:
+                    logger.debug(f"[Report] EvidenceChain 渲染失败: {ec_err}")
+                    md_lines.append("_证据链渲染失败_")
+                    md_lines.append("")
 
                 md_lines.append("---")
                 md_lines.append("")

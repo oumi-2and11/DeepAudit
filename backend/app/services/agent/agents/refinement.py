@@ -72,6 +72,8 @@ Analysis Agent 已经给出了一批**低置信度**发现（60% 左右），描
     "new_confidence": 0.85,
     "code_snippet": "从提供的代码上下文中摘出真正体现漏洞的 5~30 行代码",
     "data_flow": "user_input -> parse_argv() -> route_script_path -> execve()",
+    "call_path": ["main -> parse_argv", "parse_argv -> route_script", "route_script -> execve"],
+    "cwe_id": "CWE-78",
     "why": "解释判决理由，引用你在代码中看到的具体行",
     "suggested_verification": "建议 Verification Agent 用什么工具/PoC 思路验证（若 verdict=confirmed）"
 }
@@ -457,6 +459,8 @@ sink 关键词: {sink_hint or '(未提取到)'}
     "new_confidence": 0.xx,
     "code_snippet": "从上面真实代码中摘出体现漏洞的 5~30 行",
     "data_flow": "user_input -> ... -> sink",
+    "call_path": ["main -> parse_argv", "parse_argv -> ...", "... -> sink"],
+    "cwe_id": "CWE-xx",
     "why": "为什么这么判，引用你在代码里看到的行号或函数名",
     "suggested_verification": "如果 confirmed，建议 Verification Agent 用什么工具/PoC 思路验证"
 }}
@@ -503,6 +507,8 @@ sink 关键词: {sink_hint or '(未提取到)'}
             "new_confidence": new_conf,
             "code_snippet": parsed.get("code_snippet") or fallback_snippet[:1500] or "",
             "data_flow": parsed.get("data_flow") or "",
+            "call_path": parsed.get("call_path") or [],
+            "cwe_id": parsed.get("cwe_id") or "",
             "why": parsed.get("why") or "",
             "suggested_verification": parsed.get("suggested_verification") or "",
         }
@@ -520,6 +526,10 @@ sink 关键词: {sink_hint or '(未提取到)'}
             merged["code_snippet"] = verdict_data["code_snippet"]
         if verdict_data.get("data_flow"):
             merged["data_flow"] = verdict_data["data_flow"]
+        if verdict_data.get("call_path"):
+            merged["call_path"] = verdict_data["call_path"]
+        if verdict_data.get("cwe_id") and not merged.get("cwe_id") and not merged.get("cwe"):
+            merged["cwe_id"] = verdict_data["cwe_id"]
         if verdict_data.get("suggested_verification"):
             merged["suggested_verification"] = verdict_data["suggested_verification"]
 

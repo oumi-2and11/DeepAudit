@@ -41,7 +41,7 @@ services:
         - ALL_PROXY=
     restart: unless-stopped
     volumes:
-      # - ./backend/app:/app/app:ro  # 挂载代码目录，修改后自动生效
+      - ./backend/app:/app/app  # 🔥 挂载代码目录，配合 uvicorn --reload 实时生效（去掉 :ro 以免影响 __pycache__）
       - backend_uploads:/app/uploads
       - /var/run/docker.sock:/var/run/docker.sock # 沙箱执行必须
     ports:

@@ -338,6 +338,21 @@ Refinement 输出 `false_positive` 的直接丢；`confirmed` 的送 Verificatio
 
 ## 5. 证据链结构化 & 报告去空洞化
 
+**✅ 已实现 (2026-07-08)**
+
+实现要点：
+- 新增 `backend/app/services/agent/evidence_chain.py` — `EvidenceChain` 数据类
+- 五段结构：`source_locations` / `call_path` / `taint_flow` / `verification` / `references`
+- 完整度打分 `n/5`，缺项显式打 `⚠️ 证据不完整 (缺少: xxx)`
+- 存储方式：**不改 DB schema**，塞到现有 `AgentFinding.finding_metadata.evidence_chain` JSON 子键
+- `_save_findings` 抽 EvidenceChain 时机在写库前，Markdown/JSON 报告端直接读
+- Analysis 的 Final Answer schema 增加 `call_path` / `taint_flow` / `cwe_id`
+- Verification 的 Final Answer schema 增加 `verification_result.command/output/exit_code`
+- Refinement 的 verdict schema 也增加 `call_path` / `cwe_id`
+- Verification prompt 硬禁止 "无需修复"/"提供了有效的保护"/"该代码是安全的" 类空洞措辞
+- 报告 Markdown 每条 finding 新增"证据链"面板：5 小节 + 完整度徽章
+- 报告"审计指标"新增"证据链完整度: 平均 X.X/5 (完整 N 条, 严重不足 M 条)"
+
 ### 5.1 当前问题
 
 对照选题要求 "证据链需包含：文件位置 + 调用路径 + 验证结果"：

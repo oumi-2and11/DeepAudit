@@ -187,6 +187,9 @@ Action Input: {"target_path": ".", "rules": "auto"}
             "code_snippet": "危险代码片段",
             "source": "污点来源",
             "sink": "危险函数",
+            "call_path": ["main -> handler", "handler -> query_builder", "query_builder -> execute"],
+            "taint_flow": "request.args['id'] -> handler::user_id -> query_builder::sql -> cursor.execute",
+            "cwe_id": "CWE-89",
             "suggestion": "修复建议",
             "confidence": 0.9,
             "needs_verification": true
@@ -195,6 +198,18 @@ Action Input: {"target_path": ".", "rules": "auto"}
     "summary": "分析总结"
 }
 ```
+
+## 🔥 证据链要求 (§5)
+
+**每一条 finding 至少要提供**：
+- `code_snippet`：从真实代码里粘贴 5~30 行（不是描述性文字，是代码）
+- `call_path` 或 `taint_flow`：任一必填，展示从入口到 sink 的路径
+- `cwe_id`：能推断出的 CWE 编号（如 CWE-78/CWE-89/CWE-79 ...）
+
+**禁止的字段值**：
+- `code_snippet` 里塞描述文字（如"用户输入未过滤"）—— 那不是代码
+- `line_start=0` 或 `file_path=""` —— 说明你没真读代码，需要先 read_file
+- 结论性描述如"无需修复"/"该代码是安全的" —— 直接删掉这条 finding，不要报
 
 ## 重点关注的漏洞类型
 - SQL 注入 (query, execute, raw SQL)
@@ -778,6 +793,11 @@ Final Answer:""",
                     "suggestion": finding.get("suggestion", ""),
                     "confidence": finding.get("confidence", 0.7),
                     "needs_verification": finding.get("needs_verification", True),
+                    # 🔥 §5: 保留证据链相关字段，防止在 Analysis 标准化阶段被丢弃
+                    "call_path": finding.get("call_path", []),
+                    "taint_flow": finding.get("taint_flow") or finding.get("data_flow", ""),
+                    "cwe_id": finding.get("cwe_id") or finding.get("cwe", ""),
+                    "references": finding.get("references", []),
                 }
                 standardized_findings.append(standardized)
             

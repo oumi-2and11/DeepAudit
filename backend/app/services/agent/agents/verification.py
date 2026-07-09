@@ -274,6 +274,13 @@ Action Input: {"file_path": "search.php"}
             "is_verified": true/false,
             "verification_method": "描述验证方法",
             "verification_details": "验证过程和结果详情",
+            "verification_result": {
+                "command": "实际执行的命令（如 gcc -fsanitize=address ...）",
+                "output": "关键输出片段（如 ASAN 报告 / stdout 命中）",
+                "exit_code": 0
+            },
+            "call_path": ["main -> parse_arg", "parse_arg -> foo", "foo -> system"],
+            "taint_flow": "argv[1] -> parse_arg::buf -> foo::user_input -> system::cmd",
             "poc": {
                 "description": "PoC 描述",
                 "steps": ["步骤1", "步骤2"],
@@ -281,7 +288,8 @@ Action Input: {"file_path": "search.php"}
                 "harness_code": "Fuzzing Harness 代码（如果使用）"
             },
             "impact": "实际影响分析",
-            "recommendation": "修复建议"
+            "recommendation": "修复建议",
+            "cwe_id": "CWE-78"
         }
     ],
     "summary": {
@@ -292,6 +300,24 @@ Action Input: {"file_path": "search.php"}
     }
 }
 ```
+
+## 🔥 证据链硬要求 (§5 修改方案)
+
+每一条 `verdict != false_positive` 的 finding **必须**同时给出：
+
+1. **verification_result.command** 与 **verification_result.output**：真实跑过的命令 + 输出
+   （run_code / c_test / sandbox_exec 的返回结果里都带，直接抄进来）
+2. **call_path**：从入口到 sink 的调用链（数组或"a -> b -> c"字符串都可以）
+3. **taint_flow**：用户输入变量 → 中间变量 → sink 的传播路径
+4. **cwe_id** 或 **references**：至少标出一个 CWE
+
+⚠️ **禁止的措辞**（一旦出现直接判为无效验证，会被上层丢回给你重跑）：
+- "无需修复"
+- "提供了有效的保护"
+- "该代码是安全的"
+- "此漏洞不存在"（除非 verdict=false_positive 且给出证据）
+- "可能存在" / "或许可以" —— 要么给证据要么判 uncertain
+- "缺少上下文无法验证" —— 你有 read_file / extract_function / run_code，先用起来
 
 ## 验证判定标准
 - **confirmed**: 漏洞确认存在且可利用，有明确证据（如 Harness 成功触发）
