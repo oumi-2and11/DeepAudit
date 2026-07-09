@@ -216,6 +216,12 @@ export function useAgentStream(
         callbackOptionsRef.current.onError?.(err);
       },
 
+      // 🔥 子 Agent 单次错误（LLM 超时等）——不能设 isComplete，也不能断连接
+      onRecoverableError: (err, agentName) => {
+        console.warn(`[useAgentStream] Recoverable error from ${agentName || 'unknown'}: ${err}`);
+        // 只暴露给上游 onEvent（如果配置了）通过合成事件——AgentStreamHandler 里已经处理
+      },
+
       onHeartbeat: () => {
         callbackOptionsRef.current.onHeartbeat?.();
       },

@@ -100,6 +100,12 @@ export interface StreamOptions {
   onProgress?: (current: number, total: number, message: string) => void;
   onComplete?: (data: { findingsCount: number; securityScore: number }) => void;
   onError?: (error: string) => void;
+  /**
+   * 🔥 子 Agent 单次错误（如 LLM First Token 超时）。
+   * 与 onError 的区别：这类错误后端会继续 ReAct 循环重试或直接跑下一步，
+   * 前端**不应该**关闭连接或标记 isComplete。仅用于在时间线上留一条错误痕迹。
+   */
+  onRecoverableError?: (error: string, agentName?: string) => void;
   onHeartbeat?: () => void;
   onEvent?: StreamEventCallback;  // 通用事件回调
 }
@@ -439,11 +445,28 @@ export class AgentStreamHandler {
         break;
 
       // 错误
+      // 🔥 语义区分：
+      //   - task_error = 整个任务失败（真终止，需 disconnect）
+      //   - error      = 子 Agent 单次可恢复错误（例如 LLM First Token 超时）
+      //                  后端会继续 ReAct 循环，前端**不能**关连接，否则界面卡死。
       case 'task_error':
-      case 'error':
         this.options.onError?.(event.error || event.message || '未知错误');
         this.disconnect();
         break;
+
+      case 'error': {
+        const errMsg = event.error || event.message || '未知错误';
+        const agentName = event.agent_name;
+        // 只上报到"可恢复错误"回调，不 disconnect，不触发全局 onError
+        if (this.options.onRecoverableError) {
+          this.options.onRecoverableError(errMsg, agentName);
+        } else {
+          // 兼容旧调用方：至少在控制台留痕，别静默吞
+          console.warn(`[AgentStream] Recoverable error from ${agentName || 'unknown'}: ${errMsg}`);
+        }
+        // 关键：不 disconnect！后端还在跑
+        break;
+      }
 
       // 心跳
       case 'heartbeat':
@@ -640,6 +663,20 @@ export function createAgentStreamWithState(
     },
     onError: (error) => {
       updateState({ error, isComplete: true });
+    },
+    // 🔥 子 Agent 单次错误：只留痕，不锁死界面
+    onRecoverableError: (error, agentName) => {
+      // 追加成一条合成的错误事件，让时间线能看到，但不 setIsComplete
+      const syntheticEvent: StreamEventData = {
+        type: 'error',
+        error,
+        agent_name: agentName,
+        message: error,
+        timestamp: new Date().toISOString(),
+      } as StreamEventData;
+      updateState({
+        events: [...state.events, syntheticEvent].slice(-500),
+      });
     },
   });
 }

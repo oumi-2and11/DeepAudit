@@ -472,10 +472,12 @@ async def _execute_agent_task(task_id: str):
             _running_tasks[task_id] = orchestrator  # 兼容旧的取消逻辑
             _running_event_managers[task_id] = event_manager  # 用于 SSE 流
             
-            # 🔥 清理旧的 Agent 注册表，避免显示多个树
-            from app.services.agent.core import agent_registry
-            agent_registry.clear()
-            
+            # 🔥 并发隔离：给这个任务绑定独立的 AgentRegistry
+            # 不再用全局 clear（那会误伤并行任务），而是让每个任务持有自己的 registry。
+            # bind 之后，本 context 内所有 `agent_registry.xxx()` 调用都会路由到 per-task 实例。
+            from app.services.agent.core import bind_registry_to_task
+            bind_registry_to_task(task_id)
+
             # 注册 Orchestrator 到 Agent Registry（使用其内置方法）
             orchestrator._register_to_registry(task="Root orchestrator for security audit")
             
@@ -720,8 +722,9 @@ async def _execute_agent_task(task_id: str):
             _running_asyncio_tasks.pop(task_id, None)  # 🔥 清理 asyncio task
             _cancelled_tasks.discard(task_id)  # 🔥 清理取消标志
 
-            # 🔥 清理整个 Agent 注册表（包括所有子 Agent）
-            agent_registry.clear()
+            # 🔥 释放本任务的 per-task registry（并发隔离），避免内存泄漏
+            from app.services.agent.core import release_registry_for_task
+            release_registry_for_task(task_id)
 
             logger.debug(f"Task {task_id} cleaned up")
 
@@ -1223,8 +1226,63 @@ async def _collect_project_info(
             
     except Exception as e:
         logger.warning(f"Failed to collect project info: {e}")
-    
+
     return info
+
+
+# 🔥 §5 补丁：LLM 常把完整路径缩写成 basename（"src/openvpn/ssl_verify.c" → "ssl_verify.c"）
+# 这里在项目里搜一遍——命中一个就用它，命中多个就选路径最短的（通常是正主而非拷贝）
+# 缓存在函数属性上，同一次 audit 内多次调用只扫一次盘
+_basename_index_cache: Dict[str, Dict[str, List[str]]] = {}
+
+
+def _build_basename_index(project_root: str) -> Dict[str, List[str]]:
+    """扫描项目根，返回 basename → [相对路径列表] 的索引。缓存复用。"""
+    if project_root in _basename_index_cache:
+        return _basename_index_cache[project_root]
+
+    index: Dict[str, List[str]] = {}
+    # 跳过明显不是源码的目录，避免扫 node_modules / .git 之类
+    skip_dirs = {'.git', 'node_modules', '__pycache__', '.venv', 'venv',
+                 'target', 'build', 'dist', '.cache', '.idea', '.vscode'}
+    try:
+        for dirpath, dirnames, filenames in os.walk(project_root):
+            # 就地修改 dirnames 让 os.walk 跳过
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith('.')]
+            for fname in filenames:
+                rel = os.path.relpath(os.path.join(dirpath, fname), project_root)
+                # 归一为正斜杠，跨平台一致
+                rel = rel.replace(os.sep, '/')
+                index.setdefault(fname, []).append(rel)
+    except Exception as e:
+        logger.debug(f"[BasenameIndex] 扫描失败: {e}")
+
+    _basename_index_cache[project_root] = index
+    return index
+
+
+def _resolve_file_by_basename(project_root: str, given_path: str) -> Optional[str]:
+    """
+    LLM 只给了 basename 时用它在项目里找。
+    - 唯一命中 → 返回相对路径
+    - 多个命中 → 选路径最短的（最像"正主"）
+    - 零命中 → 返回 None
+    - given_path 本身已经带目录 → 不动，返回 None（让上层判死）
+    """
+    if not given_path or not project_root:
+        return None
+    # 已经带斜杠，说明 LLM 给了目录——那就不是"只给 basename"的场景，别乱猜
+    if '/' in given_path or '\\' in given_path:
+        return None
+    index = _build_basename_index(project_root)
+    hits = index.get(given_path) or []
+    if not hits:
+        return None
+    if len(hits) == 1:
+        return hits[0]
+    # 多个同名文件——选最短的（例如 openvpn 里 config.c 只有一个正主，
+    # 拷贝在 tests/ 或 vendor/ 里的路径更长）
+    return min(hits, key=len)
 
 
 # 🔥 §5: 从 DB 行反向构造 evidence_chain dict，用于历史数据/未预抽情况
@@ -1410,14 +1468,28 @@ async def _save_findings(
 
                 if not os.path.isfile(full_path):
                     # 尝试作为绝对路径
-                    if not (os.path.isabs(clean_path) and os.path.isfile(clean_path)):
-                        logger.warning(
-                            f"[SaveFindings] 🚫 跳过幻觉发现: 文件不存在 '{file_path}' "
-                            f"(title: {finding.get('title', 'N/A')[:50]})"
-                        )
-                        continue  # 跳过这个发现
-                # 通过验证时，如果原本有 clean 路径没行号，file_path 就用 clean_path 归一
-                file_path = clean_path
+                    if os.path.isabs(clean_path) and os.path.isfile(clean_path):
+                        file_path = clean_path  # 保留原样
+                    else:
+                        # 🔥 §5 补丁：文件不存在但可能只是缺目录前缀
+                        # LLM 常把 "src/openvpn/ssl_verify.c" 缩写成 "ssl_verify.c"
+                        # 这种情况下用 basename 在项目里搜一遍，唯一命中就用它
+                        resolved = _resolve_file_by_basename(project_root, clean_path)
+                        if resolved:
+                            logger.info(
+                                f"[SaveFindings] 🔍 file_path 智能匹配: '{clean_path}' → '{resolved}' "
+                                f"(title: {finding.get('title', 'N/A')[:50]})"
+                            )
+                            file_path = resolved
+                        else:
+                            logger.warning(
+                                f"[SaveFindings] 🚫 跳过幻觉发现: 文件不存在 '{file_path}' "
+                                f"(title: {finding.get('title', 'N/A')[:50]})"
+                            )
+                            continue  # 跳过这个发现
+                else:
+                    # 通过验证时，如果原本有 clean 路径没行号，file_path 就用 clean_path 归一
+                    file_path = clean_path
 
             # 🔥 Handle line numbers (support multiple formats)
             line_start = finding.get("line_start") or finding.get("line") or line_hint_from_text
@@ -1620,12 +1692,14 @@ async def _save_agent_tree(db: AsyncSession, task_id: str) -> None:
     保存 Agent 树到数据库
 
     🔥 在任务完成前调用，将内存中的 Agent 树持久化到数据库
+    🔥 并发隔离：显式用 per-task registry，防止误取到别的任务的树
     """
     from app.models.agent_task import AgentTreeNode
-    from app.services.agent.core import agent_registry
+    from app.services.agent.core import get_registry_for_task
 
     try:
-        tree = agent_registry.get_agent_tree()
+        task_registry = get_registry_for_task(task_id)
+        tree = task_registry.get_agent_tree()
         nodes = tree.get("nodes", {})
 
         if not nodes:
@@ -1633,6 +1707,7 @@ async def _save_agent_tree(db: AsyncSession, task_id: str) -> None:
             return
 
         logger.info(f"[SaveAgentTree] Saving {len(nodes)} agent nodes for task {task_id}")
+        logger.info(f"[SaveAgentTree] 节点详情: {[(n.get('name'), agent_id, n.get('parent_id')) for agent_id, n in nodes.items()]}")
 
         # 计算每个节点的深度
         def get_depth(agent_id: str, visited: set = None) -> int:
@@ -1652,7 +1727,7 @@ async def _save_agent_tree(db: AsyncSession, task_id: str) -> None:
         saved_count = 0
         for agent_id, node_data in nodes.items():
             # 获取 Agent 实例的统计数据
-            agent_instance = agent_registry.get_agent(agent_id)
+            agent_instance = task_registry.get_agent(agent_id)
             iterations = 0
             tool_calls = 0
             tokens_used = 0
@@ -3095,10 +3170,14 @@ async def get_agent_tree(
     logger.debug(f"[AgentTree API] task_id={task_id}, runner exists={runner is not None}")
     
     if runner:
-        from app.services.agent.core import agent_registry
-        
-        tree = agent_registry.get_agent_tree()
-        stats = agent_registry.get_statistics()
+        # 🔥 并发隔离：从 per-task registry 拿这个任务的树（而不是全局默认）
+        # get_registry_for_task 是幂等的 —— 若任务已运行过，直接返回它的 registry
+        from app.services.agent.core import get_registry_for_task
+
+        task_registry = get_registry_for_task(task_id)
+
+        tree = task_registry.get_agent_tree()
+        stats = task_registry.get_statistics()
         logger.debug(f"[AgentTree API] tree nodes={len(tree.get('nodes', {}))}, root={tree.get('root_agent_id')}")
         logger.debug(f"[AgentTree API] 节点详情: {list(tree.get('nodes', {}).keys())}")
         
@@ -3114,7 +3193,7 @@ async def get_agent_tree(
             tokens_used = 0
             findings_count = 0
             
-            agent_instance = agent_registry.get_agent(agent_id)
+            agent_instance = task_registry.get_agent(agent_id)
             if agent_instance and hasattr(agent_instance, 'get_stats'):
                 agent_stats = agent_instance.get_stats()
                 iterations = agent_stats.get("iterations", 0)

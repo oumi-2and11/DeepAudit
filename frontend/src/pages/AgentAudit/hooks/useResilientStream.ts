@@ -281,10 +281,21 @@ export function useResilientStream(
         break;
 
       case 'task_error':
-      case 'error':
         opts.onError?.(event.error || event.message || 'Unknown error');
         disconnectInternal();
         break;
+
+      case 'error': {
+        // 🔥 子 Agent 单次可恢复错误（LLM First Token 超时等），
+        // 后端会继续 ReAct 循环重试或跑下一步——绝对不能 disconnect，否则前端
+        // 界面卡死但后端还在跑（正是这个 bug）。
+        const errMsg = event.error || event.message || 'Unknown error';
+        const agentName = event.agent_name;
+        // 通过 onEvent 通道让上游看到，但不触发 onError（onError 会锁死界面）
+        console.warn(`[Stream] Recoverable error from ${agentName || 'unknown'}: ${errMsg}`);
+        // 不 disconnect
+        break;
+      }
 
       case 'heartbeat':
         handleHeartbeat();
