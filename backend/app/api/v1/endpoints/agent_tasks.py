@@ -77,7 +77,14 @@ class AgentTaskCreate(BaseModel):
     
     # 文件范围
     target_files: Optional[List[str]] = Field(None, description="指定扫描的文件")
-    
+
+    # 🔥 §6 增量扫描：指定 since_commit 时，clone 后自动 git diff 出改动文件，
+    # 覆盖 target_files。此时会跳过整轮 findings 缓存（因为语义上是子集扫描）。
+    since_commit: Optional[str] = Field(
+        None,
+        description="增量扫描起点 commit SHA。指定后只扫该 commit 到 HEAD 之间的改动文件",
+    )
+
     # Agent 配置
     max_iterations: int = Field(50, ge=1, le=200, description="最大迭代次数")
     timeout_seconds: int = Field(1800, ge=60, le=7200, description="超时时间（秒）")
@@ -321,6 +328,60 @@ async def _execute_agent_task(task_id: str):
                 event_emitter=event_emitter,  # 🔥 新增
             )
 
+            # 🔥 §6 增量扫描：若 since_commit 指定，用 git diff 出改动文件覆盖 target_files
+            _cfg = task.agent_config or {}
+            _since_commit = _cfg.get("since_commit") if isinstance(_cfg, dict) else None
+            if _since_commit:
+                try:
+                    import subprocess as _sp
+                    if not os.path.isdir(os.path.join(project_root, ".git")):
+                        await event_emitter.emit_warning(
+                            f"⚠️ 增量扫描：项目根 {project_root} 无 .git，退回全量扫描"
+                        )
+                    else:
+                        diff = _sp.run(
+                            ["git", "diff", "--name-only", f"{_since_commit}", "HEAD"],
+                            cwd=project_root,
+                            capture_output=True, text=True, timeout=30,
+                        )
+                        if diff.returncode != 0:
+                            await event_emitter.emit_warning(
+                                f"⚠️ git diff 失败（{diff.stderr.strip()[:200]}），退回全量扫描"
+                            )
+                        else:
+                            changed = [ln.strip() for ln in (diff.stdout or "").splitlines() if ln.strip()]
+                            # 只保留仍存在的文件（rename/delete 会出现在 diff 但不在 workdir）
+                            changed_existing = [
+                                f for f in changed
+                                if os.path.exists(os.path.join(project_root, f))
+                            ]
+                            if not changed_existing:
+                                await event_emitter.emit_info(
+                                    f"ℹ️ 增量扫描：{_since_commit[:8]}..HEAD 无变更文件，任务提前完成"
+                                )
+                                task.status = AgentTaskStatus.COMPLETED
+                                task.completed_at = datetime.now(timezone.utc)
+                                task.current_phase = AgentTaskPhase.REPORTING
+                                task.findings_count = 0
+                                await db.commit()
+                                await event_emitter.emit_task_complete(
+                                    findings_count=0,
+                                    duration_ms=int((time.time() - start_time) * 1000),
+                                )
+                                return
+                            task.target_files = changed_existing
+                            await event_emitter.emit_info(
+                                f"🔀 增量扫描：{_since_commit[:8]}..HEAD 共 "
+                                f"{len(changed_existing)} 个改动文件，将限定扫描范围"
+                            )
+                            logger.info(
+                                f"[incremental] task={task_id} since={_since_commit[:8]} "
+                                f"changed={len(changed_existing)}"
+                            )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[incremental] since_commit 解析异常，退回全量扫描: {e}")
+                    await event_emitter.emit_warning(f"⚠️ 增量扫描异常，退回全量：{e}")
+
             # 🔥 自动修正 target_files 路径
             # 如果发生了目录调整（例如 ZIP 解压后只有一层目录，root 被下移），
             # 原有的 target_files (如 "Prefix/file.php") 可能无法匹配。
@@ -496,6 +557,83 @@ async def _execute_agent_task(task_id: str):
             task.total_files = project_info.get("file_count", 0)
             await db.commit()
 
+            # 🔥 §6 差量增量扫描 & 缓存：整轮 findings 缓存命中检查
+            # 同 commit / 同文件树 第二次跑，直接把上次的 findings 搬过来，
+            # 跳过 Preflight / Orchestrator / 所有子 Agent。demo 反复重跑友好。
+            # target_files（增量扫描）指定了子集时不走这条路径 —— 那种情况用户
+            # 明确说了"我只想扫这几个"，缓存里的整轮结果对不上语义。
+            from app.services import scan_cache
+            _cache_hit_full = False
+            if not task.target_files:
+                try:
+                    project_fp = scan_cache.compute_project_fingerprint(project_root)
+                    if project_fp:
+                        cached_findings = scan_cache.get_findings(project_fp)
+                        if cached_findings and cached_findings.get("findings"):
+                            _cache_hit_full = True
+                            findings_from_cache = cached_findings["findings"]
+                            meta = cached_findings.get("meta") or {}
+                            await event_emitter.emit_info(
+                                f"⚡ 完整结果缓存命中 (fp={project_fp[:20]}, "
+                                f"上次任务 {meta.get('source_task_id', '?')[:8]}, "
+                                f"共 {len(findings_from_cache)} 条 finding)，"
+                                f"跳过 Preflight/Agent，直接复用"
+                            )
+                            logger.info(
+                                f"[cache] Full findings hit for task={task_id} fp={project_fp} "
+                                f"reused={len(findings_from_cache)}"
+                            )
+                            # 直接走保存流程
+                            saved_count = await _save_findings(
+                                db, task_id, findings_from_cache, project_root=project_root
+                            )
+                            task.status = AgentTaskStatus.COMPLETED
+                            task.completed_at = datetime.now(timezone.utc)
+                            task.current_phase = AgentTaskPhase.REPORTING
+                            task.findings_count = saved_count
+                            task.analyzed_files = task.total_files
+                            # 统计严重程度
+                            for f in findings_from_cache:
+                                if not isinstance(f, dict):
+                                    continue
+                                sev = str(f.get("severity", "low")).lower()
+                                if sev == "critical":
+                                    task.critical_count += 1
+                                elif sev == "high":
+                                    task.high_count += 1
+                                elif sev == "medium":
+                                    task.medium_count += 1
+                                elif sev == "low":
+                                    task.low_count += 1
+                                if f.get("is_verified") or f.get("verdict") == "confirmed":
+                                    task.verified_count = (task.verified_count or 0) + 1
+                            task.security_score = _calculate_security_score(findings_from_cache)
+                            task.quality_score = task.security_score
+                            # 缓存复用信息塞进 agent_config（JSON 字段），报告端可读
+                            try:
+                                cfg = task.agent_config or {}
+                                if not isinstance(cfg, dict):
+                                    cfg = {}
+                                cfg["cache_reuse"] = {
+                                    "source_task_id": meta.get("source_task_id"),
+                                    "fingerprint": project_fp,
+                                    "cached_at": meta.get("cached_at"),
+                                }
+                                task.agent_config = cfg
+                            except Exception:  # noqa: BLE001
+                                pass
+                            await db.commit()
+                            await event_emitter.emit_task_complete(
+                                findings_count=saved_count,
+                                duration_ms=int((time.time() - start_time) * 1000),
+                            )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[cache] findings 命中检查异常，回退到正常流程: {e}")
+                    _cache_hit_full = False
+
+            if _cache_hit_full:
+                return  # 已完整走完，直接结束这个任务
+
             # 🔥 改进项 2：Preflight 阶段（SCA + Secrets + SAST 强制前置）
             # 在把控制权交给 LLM 之前，先跑一次确定性扫描，把已知 CVE / 密钥 / SAST
             # 命中作为「已知情报」注入下游 Agent。避免 Recon 花大量 token 从零手翻
@@ -658,13 +796,33 @@ async def _execute_agent_task(task_id: str):
                 # 当 status = COMPLETED 时会自动返回 100.0
                 
                 await db.commit()
-                
+
                 await event_emitter.emit_task_complete(
                     findings_count=len(findings),
                     duration_ms=duration_ms,
                 )
-                
+
                 logger.info(f"✅ Task {task_id} completed: {len(findings)} findings, {duration_ms}ms")
+
+                # 🔥 §6 差量增量扫描 & 缓存：任务完整跑完后写入 findings 缓存
+                # 后续同 commit 的 audit 就能直接命中开头的整轮命中分支。
+                # 只在没指定 target_files 时写（子集扫描的结果不该被误当作整仓库结果复用）。
+                if not task.target_files:
+                    try:
+                        project_fp_out = scan_cache.compute_project_fingerprint(project_root)
+                        if project_fp_out:
+                            scan_cache.set_findings(
+                                project_fp_out,
+                                findings,
+                                meta={
+                                    "source_task_id": task_id,
+                                    "cached_at": datetime.now(timezone.utc).isoformat(),
+                                    "project_id": str(task.project_id),
+                                    "duration_ms": duration_ms,
+                                },
+                            )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"[cache] findings 写入失败: {e}")
             else:
                 # 🔥 检查是否是取消导致的失败
                 if result.error == "任务已取消":
@@ -1812,6 +1970,12 @@ async def create_agent_task(
         max_iterations=request.max_iterations or 50,
         timeout_seconds=request.timeout_seconds or 1800,
         created_by=current_user.id,
+        # 🔥 §6 增量扫描：since_commit 塞进 agent_config，由 _execute_agent_task 消费
+        agent_config=(
+            {"since_commit": request.since_commit}
+            if request.since_commit
+            else None
+        ),
     )
     
     db.add(task)
@@ -4052,7 +4216,7 @@ async def generate_audit_report(
     content = "\n".join(md_lines)
     
     filename = f"audit_report_{task.id[:8]}_{datetime.now().strftime('%Y%m%d')}.md"
-    
+
     from fastapi.responses import Response
     return Response(
         content=content,
@@ -4061,3 +4225,59 @@ async def generate_audit_report(
             "Content-Disposition": f"attachment; filename={filename}"
         }
     )
+
+
+# ==================== §6 扫描缓存管理 API ====================
+
+@router.get("/cache/stats")
+async def get_cache_stats(
+    current_user: User = Depends(deps.get_current_user),
+) -> Dict[str, Any]:
+    """
+    查看扫描缓存状态（deepaudit修改文档 §6）。
+
+    返回 Redis 是否可用、各类型缓存条目数量。
+    """
+    from app.services import scan_cache
+    return scan_cache.stats()
+
+
+@router.post("/cache/invalidate/{project_id}")
+async def invalidate_project_cache(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Dict[str, Any]:
+    """
+    强制清除项目缓存（用于规则升级或调试后重新扫描）。
+
+    注意：这里按"最近一次任务克隆过的 project_root"来算指纹。如果项目文件已被
+    清理（`/tmp/deepaudit/<task>` 已删），指纹算不出，只能等下次扫描时缓存自然
+    失效或用 `fingerprint` 直接指定。
+    """
+    from app.services import scan_cache
+
+    project = await db.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    if project.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权访问此项目")
+
+    # 找该项目最近的任务，拿它当时的 project_root 来算指纹
+    recent = await db.execute(
+        select(AgentTask)
+        .where(AgentTask.project_id == project_id)
+        .order_by(AgentTask.created_at.desc())
+        .limit(1)
+    )
+    task = recent.scalar_one_or_none()
+    if not task:
+        return {"cleared": 0, "reason": "no prior task"}
+
+    root_guess = f"/tmp/deepaudit/{task.id}"
+    fp = scan_cache.compute_project_fingerprint(root_guess)
+    if not fp:
+        return {"cleared": 0, "reason": f"project files no longer exist at {root_guess}"}
+    n = scan_cache.invalidate_project(fp)
+    return {"cleared": n, "fingerprint": fp}
+

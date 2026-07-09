@@ -409,6 +409,7 @@ async def run_preflight(
     from app.services.agent.tools.external_tools import (
         OSVScannerTool, GitleaksTool, SemgrepTool,
     )
+    from app.services import scan_cache
 
     result = PreflightResult()
 
@@ -416,6 +417,33 @@ async def run_preflight(
         result.warnings.append(f"project_root 不存在或不是目录: {project_root}")
         result.summary_text = "Preflight 跳过：项目根目录无效。"
         return result.to_dict()
+
+    # ----- 0) 缓存命中检查（deepaudit修改文档 §6：Preflight 缓存） -----
+    # 同 commit / 同文件树的第二次扫描，直接复用上次的 SCA/Secrets/SAST 结果。
+    # openvpn 类项目这块 semgrep 单跑就 ~90s，命中缓存后基本瞬回。
+    project_fp = scan_cache.compute_project_fingerprint(project_root)
+    if project_fp:
+        cached = scan_cache.get_preflight(project_fp)
+        if cached:
+            try:
+                if event_emitter is not None:
+                    await event_emitter.emit_phase_start(
+                        "preflight",
+                        "🛰️ Preflight（命中缓存，跳过实际扫描）",
+                    )
+                    await _emit(
+                        event_emitter, "info",
+                        f"⚡ 缓存命中 fp={project_fp[:20]}，"
+                        f"SCA={cached.get('sca', {}).get('count', 0)} "
+                        f"Secrets={cached.get('secrets', {}).get('count', 0)} "
+                        f"SAST={cached.get('sast', {}).get('count', 0)}"
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+            # 打个标记方便报告端识别
+            cached.setdefault("_cache", {})["hit"] = True
+            cached["_cache"]["fingerprint"] = project_fp
+            return cached
 
     # ----- 阶段开始事件 -----
     try:
@@ -571,7 +599,18 @@ async def run_preflight(
                 f"✅ Preflight 完成：SCA={result.sca['count']}, "
                 f"Secrets={result.secrets['count']}, SAST={result.sast['count']}")
 
-    return result.to_dict()
+    payload = result.to_dict()
+
+    # ----- 6) 写入缓存（fp 计算过但没命中时才存） -----
+    if project_fp:
+        try:
+            payload.setdefault("_cache", {})["hit"] = False
+            payload["_cache"]["fingerprint"] = project_fp
+            scan_cache.set_preflight(project_fp, payload)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[preflight] 缓存写入失败: {e}")
+
+    return payload
 
 
 def _build_summary_text(pf: PreflightResult) -> str:
