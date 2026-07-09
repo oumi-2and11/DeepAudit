@@ -1366,6 +1366,42 @@ async def _save_findings(
                 finding.get("location", "").split(":")[0] if ":" in finding.get("location", "") else finding.get("location")
             )
 
+            # 🔥 §5 补丁：LLM 时常在 description / call_path / why / code_snippet 里
+            # 塞了 "src/openvpn/httpdigest.c:72" 却漏填 file_path 字段。
+            # 报告里之前出现的 "``:578" 就是这种情况——行号在但文件名丢。
+            # 保存到 DB 前从文本里回捞一次，越早救回来越好（避免 evidence_chain 也判空）。
+            line_hint_from_text = None
+            if not file_path:
+                try:
+                    from app.services.agent.evidence_chain import _guess_file_from_text
+                    # 把 call_path（可能是 list of dict / list of str / str）展平成一段文字
+                    raw_call = finding.get("call_path")
+                    if isinstance(raw_call, list):
+                        call_text = " ".join(
+                            (str(x.get("from", "")) + " " + str(x.get("to", ""))) if isinstance(x, dict) else str(x)
+                            for x in raw_call
+                        )
+                    else:
+                        call_text = str(raw_call or "")
+                    guessed_path, guessed_line = _guess_file_from_text(
+                        str(finding.get("description") or ""),
+                        call_text,
+                        str(finding.get("why") or ""),
+                        str(finding.get("suggested_verification") or ""),
+                        str(finding.get("taint_flow") or finding.get("data_flow") or ""),
+                        str(finding.get("title") or ""),
+                        str(finding.get("code_snippet") or ""),
+                    )
+                    if guessed_path:
+                        file_path = guessed_path
+                        line_hint_from_text = guessed_line
+                        logger.info(
+                            f"[SaveFindings] 🩹 file_path 从文本回捞: '{guessed_path}':{guessed_line} "
+                            f"(title: {finding.get('title', 'N/A')[:60]})"
+                        )
+                except Exception as e:
+                    logger.debug(f"[SaveFindings] file_path 回捞失败（不影响主流程）: {e}")
+
             # 🔥 v2.1: 文件路径验证 - 过滤幻觉发现
             if project_root and file_path:
                 # 清理路径（移除可能的行号）
@@ -1380,9 +1416,11 @@ async def _save_findings(
                             f"(title: {finding.get('title', 'N/A')[:50]})"
                         )
                         continue  # 跳过这个发现
+                # 通过验证时，如果原本有 clean 路径没行号，file_path 就用 clean_path 归一
+                file_path = clean_path
 
             # 🔥 Handle line numbers (support multiple formats)
-            line_start = finding.get("line_start") or finding.get("line")
+            line_start = finding.get("line_start") or finding.get("line") or line_hint_from_text
             if not line_start and ":" in finding.get("location", ""):
                 try:
                     line_start = int(finding.get("location", "").split(":")[1])
@@ -1489,7 +1527,14 @@ async def _save_findings(
             # 落到 finding_metadata.evidence_chain 里，报告端直接读。不改 DB schema。
             try:
                 from app.services.agent.evidence_chain import EvidenceChain
-                ec = EvidenceChain.from_finding(finding)
+                # 🔥 §5 补丁：把上面回捞好的 file_path / line_start 塞回一份新 dict，
+                # 保证 EvidenceChain 拿到的和 DB 存的是同一份完整信息（原 finding 不动）
+                finding_for_ec = dict(finding)
+                if file_path and not finding_for_ec.get("file_path"):
+                    finding_for_ec["file_path"] = file_path
+                if line_start and not finding_for_ec.get("line_start"):
+                    finding_for_ec["line_start"] = line_start
+                ec = EvidenceChain.from_finding(finding_for_ec)
                 if not isinstance(finding_metadata, dict):
                     finding_metadata = {}
                 finding_metadata = dict(finding_metadata)  # 别改到 raw finding

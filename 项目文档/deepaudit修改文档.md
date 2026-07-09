@@ -404,8 +404,6 @@ class EvidenceChain(BaseModel):
 **5) 参考**
 - CWE-78: OS Command Injection
 - CVE-XXXX-XXXX（若匹配）
-```
-
 ### 5.3 涉及文件
 
 - 修改：`backend/app/models/finding.py`（数据库迁移，追加 evidence_chain JSON 字段）
@@ -463,12 +461,12 @@ class EvidenceChain(BaseModel):
 
 **裁决规则**：
 
-| A 结论 | B 结论 | 最终 |
-|---|---|---|
-| 已验证 | 已验证 | **VERIFIED_HIGH_CONFIDENCE** |
-| 已验证 | 否决 | **CONFLICT** → 送第三方（Orchestrator）裁决 |
-| 否决 | 已验证 | **CONFLICT** → 同上 |
-| 否决 | 否决 | **FALSE_POSITIVE**，丢弃 |
+| A 结论 | B 结论 | 最终                                        |
+| ------ | ------ | ------------------------------------------- |
+| 已验证 | 已验证 | **VERIFIED_HIGH_CONFIDENCE**                |
+| 已验证 | 否决   | **CONFLICT** → 送第三方（Orchestrator）裁决 |
+| 否决   | 已验证 | **CONFLICT** → 同上                         |
+| 否决   | 否决   | **FALSE_POSITIVE**，丢弃                    |
 
 **Orchestrator 裁决**：不是让 LLM 再猜一次，而是**要求 A、B 各出一段可执行证据**（命令 + 输出 or 数据流路径），Orchestrator 只做规则式合成，判定"证据强度"。
 
@@ -500,10 +498,8 @@ class EvidenceChain(BaseModel):
 
 结果结构化后作为 Analysis Agent 的**热点候选清单**：
 
-```
 Analysis 的第一步不再是"我看看这个项目有什么" ，而是：
 "这里有 47 个候选热点（附文件行号 + 规则名），逐个判断真实性"
-```
 
 ### 8.3 新工具：`trace_data_flow`
 
@@ -519,14 +515,14 @@ Analysis 的第一步不再是"我看看这个项目有什么" ，而是：
 
 ## 附录 A：改动清单速查
 
-| 模块 | 新增 | 修改 |
-|---|---|---|
-| 数据模型 | `EvidenceChain` schema | `Project.pinned_ref`、`Finding.evidence_chain`、`Finding.verdict` |
-| 输入解析 | `tests/utils/test_repo_utils.py` | `utils/repo_utils.py`、`services/scanner.py` |
+| 模块       | 新增                                                         | 修改                                                         |
+| ---------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| 数据模型   | `EvidenceChain` schema                                       | `Project.pinned_ref`、`Finding.evidence_chain`、`Finding.verdict` |
+| 输入解析   | `tests/utils/test_repo_utils.py`                             | `utils/repo_utils.py`、`services/scanner.py`                 |
 | 编排流水线 | `services/agent/stages/preflight.py`、`agents/refinement.py` | `agents/orchestrator.py`、`agents/recon.py`、`agents/analysis.py`、`agents/verification.py` |
-| 沙箱工具 | `tools/sandbox_c.py`、`tools/fuzz_tool.py`、`tools/trace_data_flow.py` | `tools/sandbox_language.py`（挂 C/C++）、`docker/sandbox/Dockerfile` |
-| 报告 | 无 | `services/report_generator.py` |
-| 前端 | 版本锚定展示、证据链可视化 | 项目详情页、报告页 |
+| 沙箱工具   | `tools/sandbox_c.py`、`tools/fuzz_tool.py`、`tools/trace_data_flow.py` | `tools/sandbox_language.py`（挂 C/C++）、`docker/sandbox/Dockerfile` |
+| 报告       | 无                                                           | `services/report_generator.py`                               |
+| 前端       | 版本锚定展示、证据链可视化                                   | 项目详情页、报告页                                           |
 
 ---
 
@@ -534,15 +530,15 @@ Analysis 的第一步不再是"我看看这个项目有什么" ，而是：
 
 现有 20 份报告里能"重跑并有明显改进"的候选：
 
-| 项目 | 主要改进关注点 | 用来演示的功能 |
-|---|---|---|
-| 项目1 OpenVPN | §3 C 语言验证 + §2 SCA | C 项目动态验证首秀 |
-| 项目2 maccms10 | §2 SCA (composer) + §4 二次分析 | 已知 CVE 链 |
-| 项目3 Vulnerable-Flask-App | §1 URL 锚定 + §7 双盲 | 靶场证据链完整闭环 |
-| 项目7 Flask 2.0.0 | §1 URL 锚定（tag=2.0.0） | 老版本 CVE 命中 |
-| 项目10 Gin 1.6.0 | §1 URL 锚定 + §2 SCA(go.sum) | Go SCA |
-| 项目17 log4j 2.14.1 | §2 SCA + §7 双盲 | log4shell 直接命中 |
-| 项目19 fastjson 1.2.24 | §2 SCA + §5 证据链 | RCE 证据完整 |
+| 项目                       | 主要改进关注点                  | 用来演示的功能     |
+| -------------------------- | ------------------------------- | ------------------ |
+| 项目1 OpenVPN              | §3 C 语言验证 + §2 SCA          | C 项目动态验证首秀 |
+| 项目2 maccms10             | §2 SCA (composer) + §4 二次分析 | 已知 CVE 链        |
+| 项目3 Vulnerable-Flask-App | §1 URL 锚定 + §7 双盲           | 靶场证据链完整闭环 |
+| 项目7 Flask 2.0.0          | §1 URL 锚定（tag=2.0.0）        | 老版本 CVE 命中    |
+| 项目10 Gin 1.6.0           | §1 URL 锚定 + §2 SCA(go.sum)    | Go SCA             |
+| 项目17 log4j 2.14.1        | §2 SCA + §7 双盲                | log4shell 直接命中 |
+| 项目19 fastjson 1.2.24     | §2 SCA + §5 证据链              | RCE 证据完整       |
 
 > 现场演示 3-5 个最能出成绩的即可。
 
@@ -550,18 +546,18 @@ Analysis 的第一步不再是"我看看这个项目有什么" ，而是：
 
 ## 附录 C：与选题要求的对齐检查
 
-| 选题要求 | 修改项覆盖 |
-|---|---|
-| 支持 GitHub/GitLab URL / 本地目录 | §1（URL 强化，本地目录已支持） |
-| 自动语言识别、依赖与文件结构提取 | §2 Preflight |
-| ≥ 2 类协作智能体，MCP/Skills/工具调用 | §7 双盲 + Refinement，总计 5 类 Agent |
-| SQL 注入、命令注入、路径遍历、硬编码密钥 | 现有覆盖 + §3 C 项目补齐 |
-| 验证智能体去误报 | §4 + §7 |
-| 自动化漏洞利用 / PoC | §3 + §5 |
-| 证据链输出（文件位置 + 调用路径 + 验证结果） | §5（Schema 化） |
-| 结构化审计报告 | §5 报告改造 |
-| 与开源项目对比、突出创新点 | 本文本身就是对比基线 |
-| ≥ 20 项目实测（含 openvpn / maccms v10） | 已完成（`一些项目的报告导出/`） |
+| 选题要求                                     | 修改项覆盖                            |
+| -------------------------------------------- | ------------------------------------- |
+| 支持 GitHub/GitLab URL / 本地目录            | §1（URL 强化，本地目录已支持）        |
+| 自动语言识别、依赖与文件结构提取             | §2 Preflight                          |
+| ≥ 2 类协作智能体，MCP/Skills/工具调用        | §7 双盲 + Refinement，总计 5 类 Agent |
+| SQL 注入、命令注入、路径遍历、硬编码密钥     | 现有覆盖 + §3 C 项目补齐              |
+| 验证智能体去误报                             | §4 + §7                               |
+| 自动化漏洞利用 / PoC                         | §3 + §5                               |
+| 证据链输出（文件位置 + 调用路径 + 验证结果） | §5（Schema 化）                       |
+| 结构化审计报告                               | §5 报告改造                           |
+| 与开源项目对比、突出创新点                   | 本文本身就是对比基线                  |
+| ≥ 20 项目实测（含 openvpn / maccms v10）     | 已完成（`一些项目的报告导出/`）       |
 
 ---
 
@@ -569,12 +565,12 @@ Analysis 的第一步不再是"我看看这个项目有什么" ，而是：
 
 按 7/17 答辩倒推，建议以下节奏：
 
-| 时间段 | 里程碑 |
-|---|---|
-| Week 1 (7/8 – 7/10) | 完成 §1（URL 锚定）+ §2（SCA 前置），跑通至少 5 个项目 |
+| 时间段               | 里程碑                                                    |
+| -------------------- | --------------------------------------------------------- |
+| Week 1 (7/8 – 7/10)  | 完成 §1（URL 锚定）+ §2（SCA 前置），跑通至少 5 个项目    |
 | Week 1 (7/11 – 7/12) | 完成 §3（C 沙箱镜像 + CTestTool），OpenVPN 首次出真实 PoC |
-| Week 2 (7/13 – 7/14) | 完成 §4 + §5，20 项目全部重跑一遍 |
-| Week 2 (7/15 – 7/16) | §7 双盲、报告 & PPT 定稿 |
-| 7/17 上午 | 现场演示 |
+| Week 2 (7/13 – 7/14) | 完成 §4 + §5，20 项目全部重跑一遍                         |
+| Week 2 (7/15 – 7/16) | §7 双盲、报告 & PPT 定稿                                  |
+| 7/17 上午            | 现场演示                                                  |
 
 §6、§8 时间富裕就做，紧张就跳过，不影响验收硬指标。

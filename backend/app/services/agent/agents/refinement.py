@@ -457,6 +457,8 @@ sink 关键词: {sink_hint or '(未提取到)'}
 {{
     "verdict": "confirmed | false_positive | still_unclear",
     "new_confidence": 0.xx,
+    "file_path": "文件相对路径，例如 src/openvpn/httpdigest.c —— **必填**，从上面真实代码上下文中确认",
+    "line_start": 123,
     "code_snippet": "从上面真实代码中摘出体现漏洞的 5~30 行",
     "data_flow": "user_input -> ... -> sink",
     "call_path": ["main -> parse_argv", "parse_argv -> ...", "... -> sink"],
@@ -532,6 +534,24 @@ sink 关键词: {sink_hint or '(未提取到)'}
             merged["cwe_id"] = verdict_data["cwe_id"]
         if verdict_data.get("suggested_verification"):
             merged["suggested_verification"] = verdict_data["suggested_verification"]
+
+        # 🔥 §5 补丁：LLM 二次分析后可能修正 file_path/line_start，比 Analysis 原始输出更靠谱
+        # 只在**原 finding 是空**或 verdict 明确给出**更详细**路径时才覆盖
+        v_file = str(verdict_data.get("file_path") or "").strip()
+        if v_file:
+            orig_file = str(merged.get("file_path") or "").strip()
+            # 场景 1: 原来就没有 → 直接补上
+            # 场景 2: 原来有但更粗略（如 "httpdigest.c"），verdict 给出更深路径 → 覆盖
+            if not orig_file or (
+                "/" in v_file and "/" not in orig_file and v_file.endswith(orig_file)
+            ):
+                merged["file_path"] = v_file
+        v_line = verdict_data.get("line_start")
+        if v_line and not merged.get("line_start"):
+            try:
+                merged["line_start"] = int(v_line)
+            except (TypeError, ValueError):
+                pass
 
         meta = dict(merged.get("finding_metadata") or {})
         meta["refinement"] = {

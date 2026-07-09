@@ -21,8 +21,46 @@ Evidence Chain (证据链) — deepaudit修改文档.md §5
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
+
+
+# 🔥 §5 补丁：LLM 常把文件名塞进 description / call_path / why 里而不填 file_path。
+# 这里从任意字符串里回捞 "xxx/yyy.c" / "xxx/yyy.py" / "xxx.c:123" 形式的路径。
+# 匹配启发式：至少一个 / 或明确的源码扩展名，避免把 "libc" 这种普通词吃进来。
+_FILE_PATH_HINT = re.compile(
+    r'(?<![A-Za-z0-9_/])'
+    r'(?P<path>'
+    r'(?:[A-Za-z0-9_.\-]+/)+[A-Za-z0-9_.\-]+\.'
+    r'(?:c|cc|cpp|cxx|h|hpp|py|js|ts|jsx|tsx|go|rs|java|kt|rb|php|cs|swift|m|mm|scala|sh)'
+    r'|[A-Za-z0-9_.\-]+\.'
+    r'(?:c|cc|cpp|cxx|h|hpp|py|js|ts|jsx|tsx|go|rs|java|kt|rb|php|cs|swift|m|mm|scala|sh)'
+    r')'
+    r'(?::(?P<line>\d+))?',
+    re.IGNORECASE,
+)
+
+
+def _guess_file_from_text(*texts: str) -> tuple[str, int]:
+    """
+    从任意字符串里回捞第一个像样的文件路径 + 可选行号。
+    LLM 就算不填 file_path，也十有八九会在 description/call_path/why 里写 "src/foo.c:123"。
+    """
+    for t in texts:
+        if not t or not isinstance(t, str):
+            continue
+        m = _FILE_PATH_HINT.search(t)
+        if m:
+            path = m.group("path")
+            # 优先取路径较深的（"src/openvpn/httpdigest.c" 好过 "httpdigest.c"）
+            # 简单起见先返回第一个命中，深度可以留给后面 iter
+            try:
+                line = int(m.group("line")) if m.group("line") else 0
+            except (TypeError, ValueError):
+                line = 0
+            return path, line
+    return "", 0
 
 
 # 完整度阈值：一段"存在"需要满足的最小样子
@@ -164,11 +202,39 @@ class EvidenceChain:
         """
         # 1) source_locations
         source_locations: List[SourceLocation] = []
-        file_path = str(finding.get("file_path") or "").strip()
+        file_path = str(finding.get("file_path") or finding.get("file") or "").strip()
         code_snippet = str(finding.get("code_snippet") or "").strip()
+
+        # 🔥 §5 补丁：如果 LLM 没填 file_path，就从描述/call_path/why/code_snippet 里回捞
+        # 报告里出现的 "``:578" 就是这种"行号在但文件名丢"的场景
+        line_hint_from_text = 0
+        if not file_path:
+            # 把 call_path 展平成一段字符串，方便正则扫
+            raw_call_for_hint = finding.get("call_path")
+            if isinstance(raw_call_for_hint, list):
+                call_hint_text = " ".join(
+                    str(x.get("from", "") + " " + x.get("to", "")) if isinstance(x, dict) else str(x)
+                    for x in raw_call_for_hint
+                )
+            else:
+                call_hint_text = str(raw_call_for_hint or "")
+
+            file_path, line_hint_from_text = _guess_file_from_text(
+                str(finding.get("description") or ""),
+                call_hint_text,
+                str(finding.get("why") or ""),
+                str(finding.get("suggested_verification") or ""),
+                str(finding.get("taint_flow") or finding.get("data_flow") or ""),
+                str(finding.get("title") or ""),
+                code_snippet,
+            )
+
         if file_path or code_snippet:
             line_start = _safe_int(
-                finding.get("line_start") or finding.get("line") or 0
+                finding.get("line_start")
+                or finding.get("line")
+                or line_hint_from_text
+                or 0
             )
             line_end = _safe_int(
                 finding.get("line_end") or (line_start if line_start else 0)

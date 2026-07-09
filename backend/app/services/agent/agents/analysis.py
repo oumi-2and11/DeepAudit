@@ -206,6 +206,11 @@ Action Input: {"target_path": ".", "rules": "auto"}
 - `call_path` 或 `taint_flow`：任一必填，展示从入口到 sink 的路径
 - `cwe_id`：能推断出的 CWE 编号（如 CWE-78/CWE-89/CWE-79 ...）
 
+**⚠️ `file_path` 是独立字段——严禁只写在 description 里！**
+❌ 错误：`file_path: ""`, `description: "在 src/openvpn/foo.c:42 中..."`
+✅ 正确：`file_path: "src/openvpn/foo.c"`, `line_start: 42`, `description: "..."`
+即使描述里也提到了文件名，**`file_path` 字段仍然必须独立填写**，否则后续证据链和验证阶段会拿不到路径。
+
 **禁止的字段值**：
 - `code_snippet` 里塞描述文字（如"用户输入未过滤"）—— 那不是代码
 - `line_start=0` 或 `file_path=""` —— 说明你没真读代码，需要先 read_file
