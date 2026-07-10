@@ -402,7 +402,11 @@ class EvidenceChain:
                 out = v.output
                 if len(out) > 1500:
                     out = out[:1500] + "\n  ... (已截断)"
-                lines.append(f"  {out}")
+                # 逐行缩进 + 防 ``` 打破外层代码块（LLM 输出可能含 PoC 代码块）
+                for _line in out.split("\n"):
+                    if _line.strip() == "```":
+                        _line = "` ``"
+                    lines.append(f"  {_line}")
                 lines.append("  ```")
             if v.exit_code is not None:
                 lines.append(f"- **退出码:** `{v.exit_code}`")
