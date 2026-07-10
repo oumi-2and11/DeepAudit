@@ -476,6 +476,31 @@ class EvidenceChain(BaseModel):
 - 修改：`agents/orchestrator.py` → 新增 `arbitrate()` 方法
 - 新增 `models/finding.py` 的 `verdict` 字段：`unverified | verified | conflict | false_positive`
 
+### 7.4 改动清单
+
+####   1、文件: models/agent_task.py
+
+  改动: AgentFinding 加 verdict (String) + cross_review (JSON) + to_dict() 补输出
+
+####2、文件: alembic/versions/009_add_cross_review.py
+
+  改动: 新迁移，加 verdict/cross_review 列 + verdict 索引（已 upgrade）
+
+####3、文件: agents/verification.py
+
+  改动: VerificationAgent.__init__ 新增 mode 参数（unified / dynamic / static）；差异化 addendum 加尾 + 工具白名单过滤
+
+####4、文件: agents/orchestrator.py
+
+  改动: ① 加 Tuple import<br>② dispatch 判断进入 _run_cross_review<br>③ 新增 5 个方法：_select_cross_review_targets /
+  _run_cross_review / _run_single_verifier / _arbitrate / _normalize_verifier_output / _merge_verdict_into_all_findings
+
+####5、文件: api/v1/endpoints/agent_tasks.py
+
+  改动: ① 创建 verification_agent_a (dynamic) / _b (static)<br>② sub_agents 注册 verification_a / verification_b（LLM
+  侧仍只见 verification，透明 fan-out）<br>③ _save_findings 消费 verdict 决定 status<br>④ AgentFindingResponse 加
+  verdict / cross_review 字段<br>⑤ AgentFinding() 构造器写入 verdict/cross_review
+
 ---
 
 ## 8. 规则包 + LLM 混合 SAST 前哨

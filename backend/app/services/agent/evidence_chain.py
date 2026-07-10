@@ -511,6 +511,50 @@ def _extract_verification(finding: Dict[str, Any]) -> VerificationEvidence:
             except (TypeError, ValueError):
                 exit_code = None
 
+    # 🔥 §7 补丁：从 cross_review 里回捞 A/B 双盲证据
+    # cross_review 结构：{"A": {verdict, hard_evidence, reason, tool_calls?...},
+    #                    "B": {...}, "arbitration": {verdict, ...}}
+    # 报告端要能读出至少一份"有 verdict + 有内容"的证据，否则会渲染成"未验证"
+    # 即使 verdict 已经写到 finding.verdict 里也没用（那只是裁决结果，不算证据本身）。
+    #
+    # 注意：condition 只检查 `not method`，不检查 `details_str/command`。因为
+    # PoC 代码可能已经被前置逻辑从 poc 字段填入 command，但 method 仍为空，
+    # 导致 VerificationEvidence.is_meaningful() 返回 False（它只检查 method）。
+    # 只要 method 为空且 cross_review 有数据，就用 ×7 双盲证据填充 method/
+    # output/verdict 段，确保报告渲染 "已验证"。
+    xr = finding.get("cross_review")
+    if isinstance(xr, dict) and not method:
+        a_side = xr.get("A") if isinstance(xr.get("A"), dict) else {}
+        b_side = xr.get("B") if isinstance(xr.get("B"), dict) else {}
+        arb = xr.get("arbitration") if isinstance(xr.get("arbitration"), dict) else {}
+
+        # 挑一边有实质内容的作为主证据来源。优先 A（动态），A 空退 B（静态）。
+        primary_side = a_side if (a_side.get("reason") or a_side.get("output")) else b_side
+        side_label = "A(动态沙箱)" if primary_side is a_side else "B(静态审查)"
+
+        if not method:
+            method = f"§7 双盲交叉复核 · {side_label}"
+        if not command:
+            command = str(
+                primary_side.get("command")
+                or primary_side.get("payload")
+                or ""
+            )
+        if not details_str:
+            # reason 是各 verifier 给出的判定理由文本；有的话直接展示
+            side_reason = str(primary_side.get("reason") or primary_side.get("output") or "")
+            arb_reason = str(arb.get("reason") or "")
+            if side_reason and arb_reason:
+                details_str = f"[{side_label} 判定] {side_reason}\n\n[裁决] {arb_reason}"
+            elif side_reason:
+                details_str = f"[{side_label} 判定] {side_reason}"
+            elif arb_reason:
+                details_str = f"[裁决] {arb_reason}"
+        if not verdict:
+            verdict = str(arb.get("verdict") or primary_side.get("verdict") or "")
+        if not tool_name:
+            tool_name = str(primary_side.get("tool_name") or "cross_review")
+
     return VerificationEvidence(
         method=method,
         command=command,

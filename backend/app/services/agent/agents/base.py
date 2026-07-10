@@ -297,6 +297,10 @@ class BaseAgent(ABC):
         self._total_tokens = 0
         self._tool_calls = 0
         self._cancelled = False
+        # 🔥 外部取消检查回调 —— 必须在 __init__ 就置 None，否则未 set/未 cancel
+        # 过的实例访问 self.is_cancelled 会 AttributeError。§7 双盲 fan-out 里的
+        # VerificationA/B 就踩过这个坑（曾经被误缩进到 cancel() 方法体内）。
+        self._cancel_callback = None
 
         # 获取超时配置
         self._timeout_config = self._get_timeout_config()
@@ -511,9 +515,6 @@ class BaseAgent(ABC):
         """取消执行"""
         self._cancelled = True
         logger.info(f"[{self.name}] Cancel requested")
-    
-        # 🔥 外部取消检查回调
-        self._cancel_callback = None
 
     def set_cancel_callback(self, callback) -> None:
         """设置外部取消检查回调"""

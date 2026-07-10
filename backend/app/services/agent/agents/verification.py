@@ -381,31 +381,103 @@ class VerificationStep:
 class VerificationAgent(BaseAgent):
     """
     漏洞验证 Agent - LLM 驱动版
-    
+
     LLM 全程参与，自主决定：
     1. 如何验证每个漏洞
     2. 使用什么工具
     3. 判断真假
+
+    🔥 §7 交叉复核：通过 mode 参数支持双盲验证
+    - mode="unified" (默认): 旧行为，全能验证器，全部工具可用
+    - mode="dynamic"  (A): 只能走沙箱动态验证（c_test/fuzz_test/run_code/sandbox_*）
+                            拒绝仅靠代码阅读下结论
+    - mode="static"   (B): 只能走静态复核（read_file/search_code/extract_function 等）
+                            禁用一切沙箱工具，只从代码语义反证
     """
-    
+
+    # 各模式下允许的工具白名单（超出的工具在执行阶段被拦下）
+    TOOL_WHITELIST_DYNAMIC = {
+        # 动态验证核心
+        "run_code", "sandbox_exec", "sandbox_http",
+        "c_test", "cpp_test", "fuzz_test",
+        # 允许最小的读取，用来把 payload 组装准（不允许仅靠 read_file 下结论）
+        "extract_function", "read_file",
+    }
+    TOOL_WHITELIST_STATIC = {
+        # 静态复核 —— 通过阅读+数据流分析反证
+        "read_file", "search_code", "extract_function",
+        "pattern_match", "trace_data_flow", "list_files",
+    }
+
+    # 附加到 system_prompt 尾部的模式差异化指令
+    _DYNAMIC_ADDENDUM = """
+
+## 🔥 §7 交叉复核 —— 你是【动态验证方】(Verification Agent A)
+你现在处于"双盲验证"的动态验证席位。规则：
+1. **你必须至少调用一次沙箱/编译类工具**（`c_test` / `fuzz_test` / `run_code` / `sandbox_exec`）
+   才允许下"verified"判断。仅靠阅读代码就说"确认漏洞存在"会被裁决层拒收。
+2. 目标：**产出可执行证据**——一段命令 + 一段真实输出（ASAN 报告 / stdout / exit code / 返回值差异）。
+3. 允许判定"未能触发"，但必须附上真实运行的命令和日志，不允许空口白话。
+4. 你**看不见另一个 Verification Agent 的存在**，别猜别人在做什么，独立下结论。
+5. 最终答案 `verdict` 字段取值：`verified` / `rejected` / `unable_to_test`；
+   `evidence_kind` 字段填 `sandbox_run` / `asan_report` / `fuzz_crash` / `none`。
+"""
+
+    _STATIC_ADDENDUM = """
+
+## 🔥 §7 交叉复核 —— 你是【静态复核方】(Verification Agent B)
+你现在处于"双盲验证"的静态复核席位。规则：
+1. **禁止调用任何沙箱/编译工具**（`c_test` / `fuzz_test` / `run_code` / `sandbox_*` 全部拒绝）。
+2. 你的武器是：`read_file` + `search_code` + `extract_function` + `trace_data_flow`。
+3. 目标：**产出反证/佐证的数据流路径**——source → 每一跳的净化/约束 → sink。
+   - 找到有效净化 / 数据源天然受限（如整数、来自可信配置）→ 判 `rejected` 并附推理链。
+   - 找不到任何净化、source 明确可控 → 判 `verified` 并附完整污点链条。
+4. 你**看不见另一个 Verification Agent 的存在**。别用"另一个 Agent 会跑 PoC"当理由。
+5. 最终答案 `verdict` 字段取值：`verified` / `rejected` / `insufficient_context`；
+   `evidence_kind` 字段填 `taint_path` / `sanitizer_found` / `source_constrained` / `none`。
+"""
+
     def __init__(
         self,
         llm_service,
         tools: Dict[str, Any],
         event_emitter=None,
+        mode: str = "unified",  # 🔥 §7 新增：unified / dynamic / static
     ):
+        # 🔥 §7: mode 决定 system_prompt 与工具白名单
+        addendum = ""
+        agent_name = "Verification"
+        if mode == "dynamic":
+            addendum = self._DYNAMIC_ADDENDUM
+            agent_name = "VerificationA"
+            # 工具白名单过滤
+            tools = {k: v for k, v in (tools or {}).items() if k in self.TOOL_WHITELIST_DYNAMIC}
+        elif mode == "static":
+            addendum = self._STATIC_ADDENDUM
+            agent_name = "VerificationB"
+            tools = {k: v for k, v in (tools or {}).items() if k in self.TOOL_WHITELIST_STATIC}
+        elif mode not in ("unified",):
+            logger.warning(f"[Verification] Unknown mode={mode!r}, falling back to unified")
+            mode = "unified"
+        self._mode = mode
+
         # 组合增强的系统提示词
-        full_system_prompt = f"{VERIFICATION_SYSTEM_PROMPT}\n\n{CORE_SECURITY_PRINCIPLES}\n\n{VULNERABILITY_PRIORITIES}"
-        
+        full_system_prompt = (
+            f"{VERIFICATION_SYSTEM_PROMPT}\n\n"
+            f"{CORE_SECURITY_PRINCIPLES}\n\n"
+            f"{VULNERABILITY_PRIORITIES}"
+            f"{addendum}"
+        )
+
         config = AgentConfig(
-            name="Verification",
+            name=agent_name,
             agent_type=AgentType.VERIFICATION,
             pattern=AgentPattern.REACT,
             max_iterations=25,
             system_prompt=full_system_prompt,
         )
         super().__init__(config, llm_service, tools, event_emitter)
-        
+
         self._conversation_history: List[Dict[str, str]] = []
         self._steps: List[VerificationStep] = []
 

@@ -1,11 +1,11 @@
 """
 扫描缓存服务（deepaudit修改文档.md §6：差量增量扫描 & 缓存）
 
-三级缓存 —— 全部落在 Redis，key 都以 `project_fingerprint` 做前缀，同一 commit
-（或同一份文件树）第二次扫描直接命中，跳过 Preflight / Verification / 整轮 Agent。
+两级缓存 —— 全部落在 Redis，key 都以 `project_fingerprint` 做前缀，同一 commit
+（或同一份文件树）第二次扫描直接命中 Preflight 与逐条 Verification 判定，
+Analysis / Refinement / Reporting 依旧每次真跑（否则整轮短路会绕开 §7 交叉复核）。
 
 - Preflight 缓存 key: `dascache:preflight:{fp}:v1` → run_preflight() 的返回 dict
-- Finding 结果缓存 key: `dascache:findings:{fp}:v1` → 完整 findings 列表 + meta
 - Verification 结果缓存 key: `dascache:verified:{fp}:{file}:{line}:{rule}` → 单条判定
 
 指纹策略：
@@ -16,6 +16,9 @@
   - 缓存全部可失败，任何 Redis 异常都吃掉并返回 None，绝对不能阻断主流程。
   - 序列化用 JSON。value 里若含 datetime 或 set，先转成 str/list。
   - TTL 默认 7 天，够覆盖同一次课程演示反复重跑，也不会永久占内存。
+
+历史：曾经有一层"整轮 findings 缓存"（get_findings/set_findings），设计意图不符
+且会短路掉 §7 交叉复核，已移除。
 """
 
 from __future__ import annotations
@@ -197,47 +200,6 @@ def set_preflight(fingerprint: str, summary: Dict[str, Any], ttl: int = _DEFAULT
     return ok
 
 
-# ==================== Findings 缓存（整轮 Agent 结果） ====================
-
-def findings_key(fingerprint: str) -> str:
-    return f"{_KEY_PREFIX}:findings:{fingerprint}"
-
-
-def get_findings(fingerprint: str) -> Optional[Dict[str, Any]]:
-    """
-    返回 {"findings": [...], "meta": {...}} 或 None。
-    meta 里塞了原任务 id、生成时间等，方便在报告里打"复用自 task xxx"标注。
-    """
-    if not fingerprint:
-        return None
-    v = _get_json(findings_key(fingerprint))
-    if v is not None:
-        n = len(v.get("findings") or [])
-        logger.info(f"[scan_cache] ✅ Findings 命中 fp={fingerprint[:20]} count={n}")
-    return v
-
-
-def set_findings(
-    fingerprint: str,
-    findings: List[Dict[str, Any]],
-    meta: Optional[Dict[str, Any]] = None,
-    ttl: int = _DEFAULT_TTL,
-) -> bool:
-    if not fingerprint:
-        return False
-    payload = {
-        "findings": findings or [],
-        "meta": meta or {},
-    }
-    ok = _set_json(findings_key(fingerprint), payload, ttl=ttl)
-    if ok:
-        logger.info(
-            f"[scan_cache] 💾 Findings 已缓存 fp={fingerprint[:20]} "
-            f"count={len(findings or [])}"
-        )
-    return ok
-
-
 # ==================== 单条 Verification 判定缓存 ====================
 
 def _norm(s: Optional[str]) -> str:
@@ -286,7 +248,7 @@ def invalidate_project(fingerprint: str) -> int:
     if c is None or not fingerprint:
         return 0
     n = 0
-    for prefix in ("preflight", "findings", "verified"):
+    for prefix in ("preflight", "verified"):
         pattern = f"{_KEY_PREFIX}:{prefix}:{fingerprint}*"
         try:
             for k in c.scan_iter(pattern, count=200):
@@ -306,7 +268,7 @@ def stats() -> Dict[str, Any]:
         return {"available": False}
     counts = {}
     try:
-        for prefix in ("preflight", "findings", "verified"):
+        for prefix in ("preflight", "verified"):
             n = 0
             for _ in c.scan_iter(f"{_KEY_PREFIX}:{prefix}:*", count=500):
                 n += 1

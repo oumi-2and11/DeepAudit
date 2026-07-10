@@ -199,10 +199,14 @@ class AgentFindingResponse(BaseModel):
     # 🔥 FIX: Map from ai_confidence in ORM, make Optional with default
     confidence: Optional[float] = Field(default=0.5, validation_alias="ai_confidence")
     status: str
-    
+
     suggestion: Optional[str] = None
     poc: Optional[dict] = None
-    
+
+    # 🔥 §7 交叉复核结果（选填，未复核 finding 为 None）
+    verdict: Optional[str] = None
+    cross_review: Optional[dict] = None
+
     created_at: datetime
     
     model_config = {
@@ -496,6 +500,21 @@ async def _execute_agent_task(task_id: str):
                 event_emitter=event_emitter,
             )
 
+            # 🔥 §7 交叉复核：双盲验证 A/B 实例（共享同一份工具，构造函数内白名单过滤）
+            # A = 动态验证方（沙箱/编译/fuzz），B = 静态复核方（读代码/搜代码/污点）
+            verification_agent_a = VerificationAgent(
+                llm_service=llm_service,
+                tools=tools.get("verification", {}),
+                event_emitter=event_emitter,
+                mode="dynamic",
+            )
+            verification_agent_b = VerificationAgent(
+                llm_service=llm_service,
+                tools=tools.get("verification", {}),
+                event_emitter=event_emitter,
+                mode="static",
+            )
+
             # 🔥 §4: Refinement Agent - 对 Analysis 的低置信度发现做二次分析
             refinement_agent = RefinementAgent(
                 llm_service=llm_service,
@@ -513,6 +532,9 @@ async def _execute_agent_task(task_id: str):
                     "analysis": analysis_agent,
                     "refinement": refinement_agent,
                     "verification": verification_agent,
+                    # 🔥 §7 双盲验证（Orchestrator 内部 fan-out，LLM 侧不可见）
+                    "verification_a": verification_agent_a,
+                    "verification_b": verification_agent_b,
                 },
             )
 
@@ -557,82 +579,19 @@ async def _execute_agent_task(task_id: str):
             task.total_files = project_info.get("file_count", 0)
             await db.commit()
 
-            # 🔥 §6 差量增量扫描 & 缓存：整轮 findings 缓存命中检查
-            # 同 commit / 同文件树 第二次跑，直接把上次的 findings 搬过来，
-            # 跳过 Preflight / Orchestrator / 所有子 Agent。demo 反复重跑友好。
-            # target_files（增量扫描）指定了子集时不走这条路径 —— 那种情况用户
-            # 明确说了"我只想扫这几个"，缓存里的整轮结果对不上语义。
-            from app.services import scan_cache
-            _cache_hit_full = False
-            if not task.target_files:
-                try:
-                    project_fp = scan_cache.compute_project_fingerprint(project_root)
-                    if project_fp:
-                        cached_findings = scan_cache.get_findings(project_fp)
-                        if cached_findings and cached_findings.get("findings"):
-                            _cache_hit_full = True
-                            findings_from_cache = cached_findings["findings"]
-                            meta = cached_findings.get("meta") or {}
-                            await event_emitter.emit_info(
-                                f"⚡ 完整结果缓存命中 (fp={project_fp[:20]}, "
-                                f"上次任务 {meta.get('source_task_id', '?')[:8]}, "
-                                f"共 {len(findings_from_cache)} 条 finding)，"
-                                f"跳过 Preflight/Agent，直接复用"
-                            )
-                            logger.info(
-                                f"[cache] Full findings hit for task={task_id} fp={project_fp} "
-                                f"reused={len(findings_from_cache)}"
-                            )
-                            # 直接走保存流程
-                            saved_count = await _save_findings(
-                                db, task_id, findings_from_cache, project_root=project_root
-                            )
-                            task.status = AgentTaskStatus.COMPLETED
-                            task.completed_at = datetime.now(timezone.utc)
-                            task.current_phase = AgentTaskPhase.REPORTING
-                            task.findings_count = saved_count
-                            task.analyzed_files = task.total_files
-                            # 统计严重程度
-                            for f in findings_from_cache:
-                                if not isinstance(f, dict):
-                                    continue
-                                sev = str(f.get("severity", "low")).lower()
-                                if sev == "critical":
-                                    task.critical_count += 1
-                                elif sev == "high":
-                                    task.high_count += 1
-                                elif sev == "medium":
-                                    task.medium_count += 1
-                                elif sev == "low":
-                                    task.low_count += 1
-                                if f.get("is_verified") or f.get("verdict") == "confirmed":
-                                    task.verified_count = (task.verified_count or 0) + 1
-                            task.security_score = _calculate_security_score(findings_from_cache)
-                            task.quality_score = task.security_score
-                            # 缓存复用信息塞进 agent_config（JSON 字段），报告端可读
-                            try:
-                                cfg = task.agent_config or {}
-                                if not isinstance(cfg, dict):
-                                    cfg = {}
-                                cfg["cache_reuse"] = {
-                                    "source_task_id": meta.get("source_task_id"),
-                                    "fingerprint": project_fp,
-                                    "cached_at": meta.get("cached_at"),
-                                }
-                                task.agent_config = cfg
-                            except Exception:  # noqa: BLE001
-                                pass
-                            await db.commit()
-                            await event_emitter.emit_task_complete(
-                                findings_count=saved_count,
-                                duration_ms=int((time.time() - start_time) * 1000),
-                            )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"[cache] findings 命中检查异常，回退到正常流程: {e}")
-                    _cache_hit_full = False
-
-            if _cache_hit_full:
-                return  # 已完整走完，直接结束这个任务
+            # §6 差量增量扫描 & 缓存说明
+            # ------------------------------------------------------------------
+            # 曾经这里有一层"整轮 findings 缓存命中检查"，指纹相同就把上次的整份
+            # findings 搬过来、`return` 出去 —— 跳过 Preflight/Recon/Analysis/
+            # Verification 全套 Agent 流程。这与 deepaudit修改文档.md §6 的设计意图
+            # 不符（§6 只讲 Preflight 缓存 + File-level embedding 缓存 + 单条
+            # verified 判定缓存，不含整轮 finding 复用），也导致 §7 交叉复核在
+            # 同 commit 重跑时永远无法触发。已移除，让 Analysis 每次都真正重新分析。
+            # 缓存加速由：
+            #   1) Preflight 缓存（stages/preflight.py 内部）
+            #   2) 单条 Verification verdict 缓存（scan_cache.get_verified/set_verified）
+            # 这两条通道承担。
+            from app.services import scan_cache  # noqa: F401 (仍供下方 preflight/verified 使用)
 
             # 🔥 改进项 2：Preflight 阶段（SCA + Secrets + SAST 强制前置）
             # 在把控制权交给 LLM 之前，先跑一次确定性扫描，把已知 CVE / 密钥 / SAST
@@ -804,25 +763,9 @@ async def _execute_agent_task(task_id: str):
 
                 logger.info(f"✅ Task {task_id} completed: {len(findings)} findings, {duration_ms}ms")
 
-                # 🔥 §6 差量增量扫描 & 缓存：任务完整跑完后写入 findings 缓存
-                # 后续同 commit 的 audit 就能直接命中开头的整轮命中分支。
-                # 只在没指定 target_files 时写（子集扫描的结果不该被误当作整仓库结果复用）。
-                if not task.target_files:
-                    try:
-                        project_fp_out = scan_cache.compute_project_fingerprint(project_root)
-                        if project_fp_out:
-                            scan_cache.set_findings(
-                                project_fp_out,
-                                findings,
-                                meta={
-                                    "source_task_id": task_id,
-                                    "cached_at": datetime.now(timezone.utc).isoformat(),
-                                    "project_id": str(task.project_id),
-                                    "duration_ms": duration_ms,
-                                },
-                            )
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning(f"[cache] findings 写入失败: {e}")
+                # §6 整轮 findings 缓存已移除（详见任务开头的说明注释）。
+                # 保留 Preflight 缓存与单条 verified 缓存承担加速职责，Analysis
+                # 阶段每次真跑，交叉复核（§7）等下游流程才能被触发。
             else:
                 # 🔥 检查是否是取消导致的失败
                 if result.error == "任务已取消":
@@ -1462,6 +1405,13 @@ def _build_evidence_chain_from_db_row(row) -> Dict[str, Any]:
             "verification_result": row.verification_result if isinstance(row.verification_result, dict) else ({"details": row.verification_result} if row.verification_result else None),
             "is_verified": row.is_verified,
             "references": row.references if isinstance(row.references, list) else None,
+            # 🔥 §7: 传 verdict + cross_review，让 _extract_verification 联动的 cross_review
+            # 补丁能把双盲证据渲染进报告。之前缺失这俩字段导致历史报告始终显示"未验证"。
+            "verdict": row.verdict,
+            "cross_review": row.cross_review if isinstance(row.cross_review, dict) else None,
+            "has_poc": row.has_poc,
+            "poc_code": row.poc_code,
+            "poc_description": row.poc_description,
         }
         return EvidenceChain.from_finding(proxy).to_dict()
     except Exception:
@@ -1576,10 +1526,21 @@ async def _save_findings(
                 type_enum = VulnerabilityType.DESERIALIZATION
 
             # 🔥 Handle file path (support multiple field names)
+            # 注意：`X or Y if COND else Z` 里 `or` 优先级高于 `if/else`，
+            # 会被解析为 `(X or Y) if COND else Z` —— 这行历史代码曾踩过：
+            # 只有 location 含 ':' 才回落到 file_path/file，否则 file_path 被静默
+            # 丢弃、直接返回 location。Bootstrap 三条 XSS 全靠 file_path=js/*.js
+            # 但没 location 字段，就在这里被吞掉，下游文本回捞误命中 "options.h"
+            # 判为幻觉。用括号显式分组修正，让 location 只作为其他字段全空时的兜底。
+            location_raw = str(finding.get("location") or "")
+            location_file = (
+                location_raw.split(":")[0] if ":" in location_raw else location_raw
+            )
             file_path = (
-                finding.get("file_path") or
-                finding.get("file") or
-                finding.get("location", "").split(":")[0] if ":" in finding.get("location", "") else finding.get("location")
+                finding.get("file_path")
+                or finding.get("file")
+                or location_file
+                or None
             )
 
             # 🔥 §5 补丁：LLM 时常在 description / call_path / why / code_snippet 里
@@ -1746,7 +1707,25 @@ async def _save_findings(
             finding_metadata = finding.get("finding_metadata") or {}
             refinement_meta = (finding_metadata or {}).get("refinement") or {}
             refinement_verdict = refinement_meta.get("verdict")
-            if refinement_verdict in ("false_positive", "auto_dropped_low_confidence"):
+
+            # 🔥 §7: 从交叉复核结果决定 status 覆盖优先级最高
+            #   verdict = false_positive          -> FALSE_POSITIVE
+            #   verdict = conflict / unverified   -> NEEDS_REVIEW
+            #   verdict = verified_*              -> VERIFIED（并置 is_verified=True）
+            cross_verdict = finding.get("verdict")
+            cross_review_data = finding.get("cross_review")
+
+            if cross_verdict == "false_positive":
+                initial_status = FindingStatus.FALSE_POSITIVE
+                is_verified = False
+            elif cross_verdict == "conflict":
+                initial_status = FindingStatus.NEEDS_REVIEW
+            elif cross_verdict in ("verified_high_confidence", "verified_single"):
+                initial_status = FindingStatus.VERIFIED
+                is_verified = True
+            elif cross_verdict == "unverified":
+                initial_status = FindingStatus.NEW
+            elif refinement_verdict in ("false_positive", "auto_dropped_low_confidence"):
                 initial_status = FindingStatus.FALSE_POSITIVE
             elif is_verified:
                 initial_status = FindingStatus.VERIFIED
@@ -1799,6 +1778,9 @@ async def _save_findings(
                 references=[{"cwe": cwe_id}] if cwe_id else None,
                 # 🔥 §4: 保留 refinement / source 等标签，报告端要用
                 finding_metadata=finding_metadata or None,
+                # 🔥 §7: 交叉复核 verdict + 双侧证据链
+                verdict=cross_verdict,
+                cross_review=cross_review_data,
             )
             db.add(db_finding)
             saved_count += 1
@@ -4107,6 +4089,8 @@ async def generate_audit_report(
                             "verdict": (ec_dict.get("verification") or {}).get("verdict", ""),
                             "is_verified": f.is_verified,
                             "references": ec_dict.get("references", []),
+                            # 🔥 §7: 传 cross_review，让 _extract_verification 把双盲证据渲染进报告
+                            "cross_review": f.cross_review if isinstance(f.cross_review, dict) else None,
                         }
                         ec = EvidenceChain.from_finding(proxy_finding)
                     else:
@@ -4119,6 +4103,10 @@ async def generate_audit_report(
                             "verification_method": f.verification_method,
                             "verification_result": f.verification_result if isinstance(f.verification_result, dict) else {"details": f.verification_result},
                             "is_verified": f.is_verified,
+                            # 🔥 §7: 传 cross_review + verdict，让 _extract_verification 把双盲证据渲染进报告
+                            "cross_review": f.cross_review if isinstance(f.cross_review, dict) else None,
+                            "verdict": f.verdict,
+                            "has_poc": f.has_poc,
                         }
                         ec = EvidenceChain.from_finding(proxy_finding)
                     md_lines.append(ec.to_markdown())

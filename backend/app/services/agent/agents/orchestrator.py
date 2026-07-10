@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 
 from .base import BaseAgent, AgentConfig, AgentResult, AgentType, AgentPattern, TaskHandoff
@@ -704,6 +704,17 @@ Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
                 "Action: dispatch_agent\n"
                 "Action Input: {\"agent\": \"refinement\", \"task\": \"对 Analysis 的 findings 做二次分析\"}"
             )
+
+        # 🔥 §7 交叉复核：LLM 调度 verification 时，若注册了 verification_a/b 双盲实例，
+        # 走内部 fan-out（Orchestrator 侧对 LLM 透明，LLM 依旧只认 "verification"）。
+        if (
+            agent_name == "verification"
+            and "verification_a" in self.sub_agents
+            and "verification_b" in self.sub_agents
+        ):
+            logger.info("[Orchestrator] §7 交叉复核：进入双盲验证流程")
+            self._dispatched_tasks[agent_name] = self._dispatched_tasks.get(agent_name, 0) + 1
+            return await self._run_cross_review(task=task, context=context)
 
         # 🔥 检查是否重复调度同一个 Agent
         dispatch_count = self._dispatched_tasks.get(agent_name, 0)
@@ -1815,3 +1826,398 @@ Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
             context_data=context_data,
             confidence=0.85,
         )
+
+    # ================== §7 Analysis × Verification 交叉复核 ==================
+
+    def _select_cross_review_targets(self) -> List[Dict[str, Any]]:
+        """
+        按 §7 范围筛选进入双盲的 finding：
+        - severity ∈ {critical, high}
+
+        历史注解：早期版本额外要求 has_poc 或 needs_verification=True。实际跑下来
+        Analysis 对高置信 finding 常常直接输出 needs_verification=False（"我很确定，
+        不用再验证了"），这个字段与"是否值得多智能体投票"的语义正好相反 —— 双盲的
+        意义恰恰是**不信任单个 LLM 的自信**。所以现在只按严重度筛，High/Critical
+        一律进双盲；PoC/needs_verification 只作为**加分项**（下面 metadata 里记录，
+        不作为准入门槛）。
+
+        Medium/Low 依旧走 verified_single 兜底路径，不占双盲资源。
+        """
+        targets = []
+        for f in self._all_findings:
+            if not isinstance(f, dict):
+                continue
+            sev = str(f.get("severity", "")).lower()
+            if sev in ("critical", "high"):
+                targets.append(f)
+        return targets
+
+    async def _run_cross_review(
+        self,
+        task: str,
+        context: str,
+    ) -> str:
+        """
+        §7 双盲交叉复核主流程。
+
+        步骤：
+          1. 从 _all_findings 里挑出范围内的 finding（Critical/High + 有 PoC/needs_verify）
+          2. 每个 finding 拆两份包，分别喂给 verification_a（动态）/ verification_b（静态）
+          3. 各 Agent 独立跑一次（并行 asyncio.gather）；A、B 之间不共享结论
+          4. 按规则表 `_arbitrate` 合成 verdict + cross_review 证据链
+          5. 结果写回 self._all_findings；范围外的 finding 补 verdict=verified_single
+        """
+        targets = self._select_cross_review_targets()
+        logger.info(
+            f"[CrossReview] 待复核 finding 数: {len(targets)} / 总 {len(self._all_findings)}"
+        )
+
+        if not targets:
+            # 范围为空 —— 给全部 finding 打一个默认 verdict 后返回。
+            # 注意：Refinement 会把 unclear finding 从 _all_findings 里剔除，
+            # 塞进 self._unclear_findings。这两条链路都要覆盖，否则 unclear
+            # 那批 finding 的 verdict 字段永远为空，API 返回体缺字段。
+            for bucket in (self._all_findings, self._unclear_findings):
+                for f in bucket:
+                    if isinstance(f, dict) and not f.get("verdict"):
+                        f["verdict"] = "verified_single" if f.get("is_verified") else "unverified"
+            return (
+                "## §7 交叉复核\n\n"
+                "无 Critical/High + PoC 级别的 finding 需要双盲验证，跳过。"
+            )
+
+        await self.emit_event(
+            "cross_review_start",
+            f"🔀 §7 交叉复核开始：{len(targets)} 个 High/Critical finding 双盲复核",
+            count=len(targets),
+        )
+
+        # 逐条双盲（A/B 并行）
+        arb_results: List[Dict[str, Any]] = []
+        for idx, finding in enumerate(targets):
+            if self.is_cancelled:
+                logger.info("[CrossReview] Cancelled")
+                break
+            await self.emit_event(
+                "cross_review_finding",
+                f"  [{idx+1}/{len(targets)}] 复核 {finding.get('file_path','?')}"
+                f":{finding.get('line_start', 0)}",
+                index=idx + 1,
+                total=len(targets),
+            )
+            try:
+                a_out, b_out = await asyncio.gather(
+                    self._run_single_verifier("verification_a", finding, task),
+                    self._run_single_verifier("verification_b", finding, task),
+                    return_exceptions=True,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"[CrossReview] gather 异常 idx={idx}: {e}")
+                a_out, b_out = None, None
+
+            # 转异常为 None，不阻断整体
+            if isinstance(a_out, Exception):
+                logger.warning(f"[CrossReview] A 抛异常: {a_out}")
+                a_out = None
+            if isinstance(b_out, Exception):
+                logger.warning(f"[CrossReview] B 抛异常: {b_out}")
+                b_out = None
+
+            verdict, cross_review, updated_finding = self._arbitrate(finding, a_out, b_out)
+
+            # 就地覆盖 _all_findings 中的对应条目（通过 file+line 匹配）
+            self._merge_verdict_into_all_findings(updated_finding, verdict, cross_review)
+            arb_results.append({
+                "file": finding.get("file_path"),
+                "line": finding.get("line_start"),
+                "verdict": verdict,
+            })
+
+        # 范围外的 finding 补默认 verdict（含 Refinement 剔出的 unclear 那批）
+        for bucket in (self._all_findings, self._unclear_findings):
+            for f in bucket:
+                if isinstance(f, dict) and not f.get("verdict"):
+                    f["verdict"] = "verified_single" if f.get("is_verified") else "unverified"
+
+        # 统计
+        stats = {}
+        for r in arb_results:
+            stats[r["verdict"]] = stats.get(r["verdict"], 0) + 1
+
+        await self.emit_event(
+            "cross_review_done",
+            f"✅ §7 交叉复核完成：{stats}",
+            stats=stats,
+        )
+        logger.info(f"[CrossReview] 完成，verdict 分布: {stats}")
+
+        # 返回 observation 给 Orchestrator 的 LLM 继续下一步
+        lines = [
+            "## §7 交叉复核完成",
+            "",
+            f"复核 {len(arb_results)} 条 High/Critical finding。判定分布：",
+            "",
+        ]
+        for k, v in stats.items():
+            lines.append(f"- **{k}**: {v}")
+        lines.append("")
+        lines.append("按规则式仲裁合成，无需再单独调度 verification。")
+        lines.append("你现在应该使用 `finish` 操作结束审计并汇总。")
+        return "\n".join(lines)
+
+    async def _run_single_verifier(
+        self,
+        agent_key: str,
+        finding: Dict[str, Any],
+        task: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        跑单个 verification agent（A 或 B），只喂 1 条 finding，返回 raw output dict。
+        失败/超时返回 None。
+        """
+        agent = self.sub_agents.get(agent_key)
+        if not agent:
+            return None
+
+        agent.set_parent_id(self._agent_id)
+        # 每条 finding 单独注册一次，让 Agent Tree 看得见 A/B 并行
+        try:
+            agent._registered = False  # 允许重注册（每条 finding 一个新节点）
+        except Exception:  # noqa: BLE001
+            pass
+        agent._register_to_registry(
+            task=f"§7 复核: {finding.get('file_path','?')}:{finding.get('line_start',0)}"
+        )
+
+        project_info = self._runtime_context.get("project_info", {}).copy()
+        if "root" not in project_info:
+            project_info["root"] = self._runtime_context.get("project_root", ".")
+
+        sub_input = {
+            "task": (
+                f"§7 双盲复核：仅对下方这 1 条 finding 独立判定，"
+                f"输出 verdict（verified/rejected/abstain）+ evidence"
+            ),
+            "task_context": (
+                f"目标文件: {finding.get('file_path','?')}:{finding.get('line_start',0)}\n"
+                f"类型: {finding.get('vulnerability_type','?')}\n"
+                f"标题: {finding.get('title','?')}"
+            ),
+            "project_info": project_info,
+            "config": self._runtime_context.get("config", {}),
+            "project_root": self._runtime_context.get("project_root", "."),
+            "previous_results": {"findings": [finding]},
+            "handoff": None,
+            "preflight_summary": self._runtime_context.get("preflight_summary") or {},
+        }
+
+        timeout = self._timeout_config.get("sub_agent_timeout", 600)
+        try:
+            result = await asyncio.wait_for(agent.run(sub_input), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"[CrossReview] {agent_key} 超时 ({timeout}s)")
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[CrossReview] {agent_key} 异常: {e}", exc_info=True)
+            return None
+
+        if not result or not result.success or not isinstance(result.data, dict):
+            return None
+
+        # verifier 返回结构：data.findings[0] 是它对这条 finding 的判定
+        findings_out = result.data.get("findings") or []
+        if findings_out and isinstance(findings_out[0], dict):
+            return findings_out[0]
+        # 有些实现把判定放在顶层 summary
+        return {
+            "verdict": (result.data.get("summary") or {}).get("verdict"),
+            "verification_details": result.data.get("summary"),
+        }
+
+    def _arbitrate(
+        self,
+        finding: Dict[str, Any],
+        a_out: Optional[Dict[str, Any]],
+        b_out: Optional[Dict[str, Any]],
+    ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+        """
+        §7 规则式仲裁 —— 不再问 LLM，纯规则合成 verdict。
+
+        规范化：把各 mode 的原始 verdict 统一映射到 {verified, rejected, abstain}。
+        A 的硬证据：verification_result.command + output（sandbox_run / asan_report）
+                    或 evidence_kind ∈ {sandbox_run, asan_report, fuzz_crash}
+        B 的硬证据：evidence_kind == 'sanitizer_found' 或 'source_constrained'
+                    （能说清 sink 前的净化/约束）
+        """
+        a_v, a_hard, a_reason = self._normalize_verifier_output(a_out, side="A")
+        b_v, b_hard, b_reason = self._normalize_verifier_output(b_out, side="B")
+
+        # 决策表
+        # 优先级：双确认 > 有硬证据者胜 > 双否决 > 冲突
+        verdict: str
+        arb_reason: str
+
+        if a_v == "verified" and b_v == "verified":
+            if a_hard or b_hard:
+                verdict = "verified_high_confidence"
+                arb_reason = (
+                    "A、B 双盲双确认，且至少一方持沙箱/数据流硬证据"
+                    f"（A_hard={a_hard}, B_hard={b_hard}）"
+                )
+            else:
+                verdict = "verified_single"
+                arb_reason = "A、B 双盲双确认，但均为软证据 → 单侧强度"
+        elif a_v == "rejected" and b_v == "rejected":
+            verdict = "false_positive"
+            arb_reason = "A、B 双盲双否决"
+        elif a_v == "verified" and b_v == "rejected":
+            if a_hard and not b_hard:
+                verdict = "verified_single"
+                arb_reason = "A 持沙箱硬证据 vs B 无硬反证 → A 胜"
+            elif b_hard and not a_hard:
+                verdict = "false_positive"
+                arb_reason = "B 持硬反证（净化/约束）vs A 无硬证据 → B 胜"
+            else:
+                verdict = "conflict"
+                arb_reason = "A verified vs B rejected 且证据强度相当 → 待人工"
+        elif a_v == "rejected" and b_v == "verified":
+            if b_hard and not a_hard:
+                verdict = "verified_single"
+                arb_reason = "B 持数据流硬证据 vs A 未能触发 → B 胜"
+            elif a_hard and not b_hard:
+                verdict = "false_positive"
+                arb_reason = "A 沙箱未触发（硬证据）vs B 静态推断 → A 胜"
+            else:
+                verdict = "conflict"
+                arb_reason = "A rejected vs B verified 且证据强度相当 → 待人工"
+        elif a_v == "verified" or b_v == "verified":
+            # 一方 abstain（超时/异常）另一方 verified：降级为单侧
+            side = "A" if a_v == "verified" else "B"
+            hard = a_hard if a_v == "verified" else b_hard
+            if hard:
+                verdict = "verified_single"
+                arb_reason = f"仅 {side} 方复核有效且持硬证据 → 单侧通过"
+            else:
+                verdict = "conflict"
+                arb_reason = f"仅 {side} 方复核有效但为软证据 → 待人工"
+        elif a_v == "rejected" or b_v == "rejected":
+            verdict = "conflict"
+            arb_reason = "仅一方反驳有效，另一方缺失 → 待人工"
+        else:
+            # 双 abstain
+            verdict = "unverified"
+            arb_reason = "A、B 均未能完成复核（超时/异常）"
+
+        cross_review = {
+            "A": {
+                "verdict": a_v,
+                "hard_evidence": a_hard,
+                "reason": a_reason,
+                "evidence_kind": (a_out or {}).get("evidence_kind"),
+                "verification_result": (a_out or {}).get("verification_result"),
+                "verification_details": (a_out or {}).get("verification_details"),
+                "call_path": (a_out or {}).get("call_path"),
+            },
+            "B": {
+                "verdict": b_v,
+                "hard_evidence": b_hard,
+                "reason": b_reason,
+                "evidence_kind": (b_out or {}).get("evidence_kind"),
+                "taint_flow": (b_out or {}).get("taint_flow"),
+                "verification_details": (b_out or {}).get("verification_details"),
+            },
+            "arbitration": {
+                "verdict": verdict,
+                "reason": arb_reason,
+            },
+        }
+
+        # 更新 finding 主体：把 A 的 PoC / call_path、B 的 taint_flow 保存下来
+        updated = dict(finding)
+        # 合并 PoC（若 A 输出了）
+        a_poc = (a_out or {}).get("poc")
+        if a_poc and not updated.get("poc"):
+            updated["poc"] = a_poc
+        if (a_out or {}).get("call_path") and not updated.get("call_path"):
+            updated["call_path"] = (a_out or {}).get("call_path")
+        if (b_out or {}).get("taint_flow") and not updated.get("taint_flow"):
+            updated["taint_flow"] = (b_out or {}).get("taint_flow")
+
+        # is_verified 语义：verified_high_confidence / verified_single 都算已验证
+        updated["is_verified"] = verdict in ("verified_high_confidence", "verified_single")
+
+        return verdict, cross_review, updated
+
+    @staticmethod
+    def _normalize_verifier_output(
+        out: Optional[Dict[str, Any]],
+        side: str,
+    ) -> Tuple[str, bool, str]:
+        """
+        把 verifier 的原始 verdict 归一为 {verified, rejected, abstain}，
+        并判定是否持"硬证据"。返回 (verdict, is_hard, reason)。
+        """
+        if not out or not isinstance(out, dict):
+            return "abstain", False, f"{side} 未返回有效结果"
+
+        raw = str(out.get("verdict") or "").strip().lower()
+
+        # 归一化 verdict
+        if raw in ("verified", "confirmed", "likely"):
+            v = "verified"
+        elif raw in ("rejected", "false_positive", "false-positive"):
+            v = "rejected"
+        elif raw in ("unable_to_test", "insufficient_context", "uncertain", "abstain", ""):
+            v = "abstain"
+        else:
+            v = "abstain"
+
+        # 硬证据判定
+        is_hard = False
+        ek = str(out.get("evidence_kind") or "").strip().lower()
+        if side == "A":
+            # 动态方：真实跑过沙箱 / 拿到 ASAN 或 crash
+            if ek in ("sandbox_run", "asan_report", "fuzz_crash"):
+                is_hard = True
+            vr = out.get("verification_result") or {}
+            if isinstance(vr, dict) and (vr.get("command") and vr.get("output")):
+                is_hard = True
+        elif side == "B":
+            # 静态方：找到净化 / 源受限 / 明确污点路径
+            if ek in ("sanitizer_found", "source_constrained", "taint_path"):
+                is_hard = True
+            if out.get("taint_flow"):
+                is_hard = True
+
+        # reason 简短摘要
+        reason = (out.get("verification_details") or out.get("reason") or "")[:300]
+        return v, is_hard, reason
+
+    def _merge_verdict_into_all_findings(
+        self,
+        updated_finding: Dict[str, Any],
+        verdict: str,
+        cross_review: Dict[str, Any],
+    ) -> None:
+        """把 verdict 和 cross_review 合并回 self._all_findings 里对应的 finding。"""
+        target_file = (updated_finding.get("file_path") or "").strip()
+        target_line = updated_finding.get("line_start") or 0
+        target_type = (updated_finding.get("vulnerability_type") or "").strip().lower()
+
+        for i, f in enumerate(self._all_findings):
+            if not isinstance(f, dict):
+                continue
+            same_file = (f.get("file_path") or "").strip() == target_file
+            same_line = (f.get("line_start") or 0) == target_line
+            same_type = (f.get("vulnerability_type") or "").strip().lower() == target_type
+            if same_file and (same_line or same_type):
+                merged = {**f, **updated_finding}
+                merged["verdict"] = verdict
+                merged["cross_review"] = cross_review
+                self._all_findings[i] = merged
+                return
+
+        # 没找到对应 —— 兜底直接添加
+        updated_finding["verdict"] = verdict
+        updated_finding["cross_review"] = cross_review
+        self._all_findings.append(updated_finding)

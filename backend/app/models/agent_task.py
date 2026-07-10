@@ -359,6 +359,17 @@ class AgentFinding(Base):
     verification_method = Column(Text, nullable=True)
     verification_result = Column(JSON, nullable=True)
     verified_at = Column(DateTime(timezone=True), nullable=True)
+
+    # 🔥 §7 交叉复核结果字段
+    # 取值：
+    #   None / "unverified"           - 未走验证流程
+    #   "verified_high_confidence"    - A/B 双盲双确认，且至少一方有沙箱证据
+    #   "verified_single"             - 只有一方通过，或双方软证据一致
+    #   "conflict"                    - A/B 结论冲突且没有硬证据可仲裁 → needs_review
+    #   "false_positive"              - A/B 双双否决
+    verdict = Column(String(40), nullable=True, index=True)
+    # 交叉复核的证据链（A 端、B 端、仲裁摘要），报告端渲染三段证据
+    cross_review = Column(JSON, nullable=True)
     
     # PoC
     has_poc = Column(Boolean, default=False)
@@ -435,6 +446,8 @@ class AgentFinding(Base):
             "code_snippet": self.code_snippet,
             "status": self.status,
             "is_verified": self.is_verified,
+            "verdict": self.verdict,
+            "cross_review": self.cross_review,
             "has_poc": self.has_poc,
             "poc_code": self.poc_code,
             "suggestion": self.suggestion,
