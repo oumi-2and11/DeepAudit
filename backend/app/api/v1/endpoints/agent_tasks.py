@@ -1743,13 +1743,21 @@ async def _save_findings(
                     finding_for_ec["file_path"] = file_path
                 if line_start and not finding_for_ec.get("line_start"):
                     finding_for_ec["line_start"] = line_start
+                logger.warning("[SaveFindings] EC input: vm=%r cr=%s",
+                             finding_for_ec.get("verification_method", "MISSING"),
+                             "CR_DICT" if isinstance(finding_for_ec.get("cross_review"), dict)
+                             else f"CR_{type(finding_for_ec.get('cross_review')).__name__}"
+                             if finding_for_ec.get("cross_review") is not None else "CR_NONE")
                 ec = EvidenceChain.from_finding(finding_for_ec)
                 if not isinstance(finding_metadata, dict):
                     finding_metadata = {}
                 finding_metadata = dict(finding_metadata)  # 别改到 raw finding
                 finding_metadata["evidence_chain"] = ec.to_dict()
+                logger.warning("[SaveFindings] EC stored: method=%r tool=%r v=%r meaningful=%s",
+                             ec.verification.method, ec.verification.tool_name,
+                             ec.verification.verdict, ec.verification.is_meaningful())
             except Exception as e:
-                logger.debug(f"[SaveFindings] EvidenceChain 抽取失败（不影响主流程）: {e}")
+                logger.warning(f"[SaveFindings] EvidenceChain 抽取失败（不影响主流程）: {e}", exc_info=True)
 
             db_finding = AgentFinding(
                 id=str(uuid4()),
@@ -4064,6 +4072,9 @@ async def generate_audit_report(
                     fmeta = f.finding_metadata if isinstance(f.finding_metadata, dict) else {}
                     ec_dict = (fmeta or {}).get("evidence_chain")
                     if ec_dict:
+                        logger.debug("[Report] Path1 (pre-stored ec_dict) path=%s verdict=%s cr=%s",
+                                     f.file_path, f.verdict,
+                                     bool(isinstance(f.cross_review, dict) and f.cross_review))
                         # 已经预抽好了，直接渲染
                         ec = EvidenceChain(
                             source_locations=[],
@@ -4094,6 +4105,9 @@ async def generate_audit_report(
                         }
                         ec = EvidenceChain.from_finding(proxy_finding)
                     else:
+                        logger.debug("[Report] Path2 (build from DB row) path=%s verdict=%s cr=%s",
+                                     f.file_path, f.verdict,
+                                     bool(isinstance(f.cross_review, dict) and f.cross_review))
                         # 没预抽——从 DB 行现构，保证老数据也能显示
                         proxy_finding = {
                             "file_path": f.file_path,
@@ -4110,8 +4124,42 @@ async def generate_audit_report(
                         }
                         ec = EvidenceChain.from_finding(proxy_finding)
                     md_lines.append(ec.to_markdown())
+                    # 🔥 §7 safety net: 如果 evidence_chain 的 verification 段不达标，
+                    # 但 cross_review 有数据（可能是旧数据或保存时遗漏），直接追加渲染
+                    if not ec.verification.is_meaningful() and isinstance(f.cross_review, dict) and f.cross_review:
+                        cr = f.cross_review
+                        a = cr.get("A") if isinstance(cr.get("A"), dict) else {}
+                        b = cr.get("B") if isinstance(cr.get("B"), dict) else {}
+                        ar = cr.get("arbitration") if isinstance(cr.get("arbitration"), dict) else {}
+                        side = a if (a.get("reason") or a.get("output")) else b
+                        side_label = "A(动态沙箱)" if side is a else "B(静态审查)"
+                        md_lines.append("")
+                        md_lines.append("#### 4) 验证 (safety net: §7 cross_review 补渲)")
+                        md_lines.append(f"- **方法**: §7 双盲交叉复核 · {side_label}")
+                        md_lines.append(f"- **判定**: {ar.get('verdict') or side.get('verdict') or 'unknown'}")
+                        if side.get("reason"):
+                            md_lines.append(f"- **{side_label} 理由**: {side.get('reason')[:300]}")
+                        if ar.get("reason"):
+                            md_lines.append(f"- **裁决**: {ar.get('reason')[:300]}")
+                        vr = side.get("verification_result")
+                        if isinstance(vr, dict):
+                            if vr.get("command"):
+                                md_lines.append(f"- **命令**: `{vr['command']}`")
+                            if vr.get("output"):
+                                md_lines.append(f"- **输出**:")
+                                md_lines.append(f"  ```")
+                                lines = vr["output"].split("\n")
+                                for l in lines[:10]:
+                                    md_lines.append(f"  {l}")
+                                if len(lines) > 10:
+                                    md_lines.append(f"  ... (已截断, 共 {len(lines)} 行)")
+                                md_lines.append(f"  ```")
+                        # B side stats
+                        if b is not side and b.get("reason"):
+                            md_lines.append(f"- **B(静态审查) 理由**: {b['reason'][:200]}")
+                        logger.warning("[Report] §7 safety net triggered for %s", f.file_path)
                 except Exception as ec_err:
-                    logger.debug(f"[Report] EvidenceChain 渲染失败: {ec_err}")
+                    logger.warning(f"[Report] EvidenceChain 渲染失败: {ec_err}", exc_info=True)
                     md_lines.append("_证据链渲染失败_")
                     md_lines.append("")
 

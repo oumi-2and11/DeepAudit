@@ -159,10 +159,13 @@ class EvidenceChain:
 
     def completeness(self) -> Dict[str, bool]:
         """返回 5 段每一段是否达标。"""
+        # taint_flow 里可能是 Unicode 箭头 → (U+2192) 或 ASCII ->，两种都计
+        tf = self.taint_flow
+        arrow_count = tf.count("->") + tf.count("→")
         return {
             "source_locations": any(s.is_meaningful() for s in self.source_locations),
             "call_path": any(e.is_meaningful() for e in self.call_path),
-            "taint_flow": self.taint_flow.count("->") >= _MIN_FLOW_ARROWS,
+            "taint_flow": arrow_count >= _MIN_FLOW_ARROWS,
             "verification": self.verification.is_meaningful(),
             "references": any(r.is_meaningful() for r in self.references),
         }
@@ -250,6 +253,8 @@ class EvidenceChain:
         # 2) call_path —— 允许两种输入形式：
         #    - finding["call_path"] = [{"from": "...", "to": "..."}]
         #    - finding["call_path"] = "main -> parse -> foo -> system"（一串箭头）
+        # 注意：LLM 有时输出 → (Unicode U+2192) 代替 -> (ASCII)，先归一化。
+        _ARROW = "->"
         call_path: List[CallEdge] = []
         raw_call = finding.get("call_path")
         if isinstance(raw_call, list):
@@ -259,11 +264,13 @@ class EvidenceChain:
                         frm=str(edge.get("from") or edge.get("frm") or ""),
                         to=str(edge.get("to") or ""),
                     ))
-                elif isinstance(edge, str) and "->" in edge:
-                    a, _, b = edge.partition("->")
+                elif isinstance(edge, str) and ("->" in edge or "→" in edge):
+                    norm = edge.replace("→", "->")
+                    a, _, b = norm.partition("->")
                     call_path.append(CallEdge(frm=a.strip(), to=b.strip()))
-        elif isinstance(raw_call, str) and "->" in raw_call:
-            nodes = [n.strip() for n in raw_call.split("->") if n.strip()]
+        elif isinstance(raw_call, str) and ("->" in raw_call or "→" in raw_call):
+            norm = raw_call.replace("→", "->")
+            nodes = [n.strip() for n in norm.split("->") if n.strip()]
             for i in range(len(nodes) - 1):
                 call_path.append(CallEdge(frm=nodes[i], to=nodes[i + 1]))
 
@@ -523,37 +530,59 @@ def _extract_verification(finding: Dict[str, Any]) -> VerificationEvidence:
     # 只要 method 为空且 cross_review 有数据，就用 ×7 双盲证据填充 method/
     # output/verdict 段，确保报告渲染 "已验证"。
     xr = finding.get("cross_review")
-    if isinstance(xr, dict) and not method:
-        a_side = xr.get("A") if isinstance(xr.get("A"), dict) else {}
-        b_side = xr.get("B") if isinstance(xr.get("B"), dict) else {}
-        arb = xr.get("arbitration") if isinstance(xr.get("arbitration"), dict) else {}
-
-        # 挑一边有实质内容的作为主证据来源。优先 A（动态），A 空退 B（静态）。
-        primary_side = a_side if (a_side.get("reason") or a_side.get("output")) else b_side
-        side_label = "A(动态沙箱)" if primary_side is a_side else "B(静态审查)"
-
-        if not method:
-            method = f"§7 双盲交叉复核 · {side_label}"
-        if not command:
-            command = str(
-                primary_side.get("command")
-                or primary_side.get("payload")
-                or ""
+    import logging as _lg2
+    _lg2.getLogger(__name__).warning(
+        "[_extract_verification] pre-§7 check: method=%r xr_type=%s isinstance_dict=%s",
+        method, type(xr).__name__, isinstance(xr, dict),
+    )
+    if isinstance(xr, dict):
+        # §7 数据可用时，如果当前 method 为空或者验证不达标，就用 §7 数据覆盖
+        current_meaningful = bool(method) and (len(details_str) + len(command) >= 20)
+        if not current_meaningful:
+            import logging as _lg3
+            _lg3.getLogger(__name__).warning(
+                "[_extract_verification] §7 block ENTERED: method=%r xr_keys=%s",
+                method, list(xr.keys()),
             )
-        if not details_str:
-            # reason 是各 verifier 给出的判定理由文本；有的话直接展示
-            side_reason = str(primary_side.get("reason") or primary_side.get("output") or "")
-            arb_reason = str(arb.get("reason") or "")
-            if side_reason and arb_reason:
-                details_str = f"[{side_label} 判定] {side_reason}\n\n[裁决] {arb_reason}"
-            elif side_reason:
-                details_str = f"[{side_label} 判定] {side_reason}"
-            elif arb_reason:
-                details_str = f"[裁决] {arb_reason}"
-        if not verdict:
-            verdict = str(arb.get("verdict") or primary_side.get("verdict") or "")
-        if not tool_name:
-            tool_name = str(primary_side.get("tool_name") or "cross_review")
+            a_side = xr.get("A") if isinstance(xr.get("A"), dict) else {}
+            b_side = xr.get("B") if isinstance(xr.get("B"), dict) else {}
+            arb = xr.get("arbitration") if isinstance(xr.get("arbitration"), dict) else {}
+            _lg3.getLogger(__name__).warning(
+                "[_extract_verification] §7 a_side.reason=%s b_side.reason=%s",
+                bool(a_side.get("reason")), bool(b_side.get("reason")),
+            )
+
+            # 挑一边有实质内容的作为主证据来源。优先 A（动态），A 空退 B（静态）。
+            primary_side = a_side if (a_side.get("reason") or a_side.get("output")) else b_side
+            side_label = "A(动态沙箱)" if primary_side is a_side else "B(静态审查)"
+
+            if not method:
+                method = f"§7 双盲交叉复核 · {side_label}"
+            if not command:
+                command = str(
+                    primary_side.get("command")
+                    or primary_side.get("payload")
+                    or ""
+                )
+            if not details_str:
+                # reason 是各 verifier 给出的判定理由文本；有的话直接展示
+                side_reason = str(primary_side.get("reason") or primary_side.get("output") or "")
+                arb_reason = str(arb.get("reason") or "")
+                if side_reason and arb_reason:
+                    details_str = f"[{side_label} 判定] {side_reason}\n\n[裁决] {arb_reason}"
+                elif side_reason:
+                    details_str = f"[{side_label} 判定] {side_reason}"
+                elif arb_reason:
+                    details_str = f"[裁决] {arb_reason}"
+            if not verdict:
+                verdict = str(arb.get("verdict") or primary_side.get("verdict") or "")
+            if not tool_name:
+                tool_name = str(primary_side.get("tool_name") or "cross_review")
+
+            _lg3.getLogger(__name__).warning(
+                "[_extract_verification] §7 block RESULT: method=%r tool_name=%r verdict=%r",
+                method, tool_name, verdict,
+            )
 
     return VerificationEvidence(
         method=method,
