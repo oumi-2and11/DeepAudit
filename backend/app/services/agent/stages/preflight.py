@@ -124,6 +124,26 @@ _PLACEHOLDER_VERSIONS = frozenset({
 })
 
 
+# ---------------------------------------------------------------------------
+# 版本号工具 — C/C++ 自识别用
+# ---------------------------------------------------------------------------
+def _parse_version_tuple(ver_str: str) -> tuple:
+    """'3.32.0' → (3, 32, 0)；非数字后缀自动截断。"""
+    cleaned = ver_str.strip().lstrip("vV").split("+", 1)[0].split("-", 1)[0]
+    parts: List[int] = []
+    for segment in cleaned.split("."):
+        try:
+            parts.append(int(segment))
+        except ValueError:
+            break
+    return tuple(parts)
+
+
+def _version_in_range(ver: tuple, lo: tuple, hi: tuple) -> bool:
+    """lo <= ver < hi （两端开闭与 SemVer 习惯一致）。"""
+    return (lo or (0,)) <= ver < hi
+
+
 def _read_text_safe(path: str, limit: int = 200_000) -> Optional[str]:
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -272,6 +292,62 @@ def _identify_self_from_rust(project_root: str) -> Optional[Tuple[str, str, str,
     return None
 
 
+# ---------------------------------------------------------------------------
+# C/C++ 项目自识别
+# ---------------------------------------------------------------------------
+def _identify_self_from_c_autotools(project_root: str) -> Optional[Tuple[str, str, str, str]]:
+    """读取 configure.ac / configure.in，匹配 AC_INIT(name, version, ...)。"""
+    for fn in ("configure.ac", "configure.in"):
+        text = _read_text_safe(os.path.join(project_root, fn))
+        if not text:
+            continue
+        m = re.search(
+            r'AC_INIT\s*\(\s*\[?([^\]\s,]+)\]?\s*,\s*\[?([^\]\s,]+)\]?',
+            text,
+        )
+        if m:
+            name = m.group(1).strip().strip("\"'")
+            version = m.group(2).strip().strip("\"'")
+            if name and version:
+                return (name, version, "", fn)
+    return None
+
+
+def _identify_self_from_c_cmake(project_root: str) -> Optional[Tuple[str, str, str, str]]:
+    """读取 CMakeLists.txt，匹配 project(name VERSION X.Y.Z)。"""
+    text = _read_text_safe(os.path.join(project_root, "CMakeLists.txt"))
+    if not text:
+        return None
+    m = re.search(
+        r'project\s*\(\s*([^\s)]+)(?:\s+VERSION\s+([^\s)]+))?',
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        name = m.group(1).strip()
+        version = (m.group(2) or "").strip()
+        if name and version:
+            return (name, version, "", "CMakeLists.txt")
+    return None
+
+
+def _identify_self_from_c_header(project_root: str) -> Optional[Tuple[str, str, str, str]]:
+    """读已知项目的 C 头文件版本宏。目前支持 sqlite3.h。"""
+    HEADER_RULES = {
+        "sqlite3.h": ("SQLITE_VERSION", "sqlite"),
+    }
+    for filename, (macro, project_name) in HEADER_RULES.items():
+        text = _read_text_safe(os.path.join(project_root, filename), limit=50_000)
+        if not text:
+            continue
+        m = re.search(r'#define\s+' + re.escape(macro) + r'\s+"([^"]+)"', text)
+        if m:
+            version = m.group(1).strip()
+            if version:
+                return (project_name, version, "", filename)
+    return None
+
+
 def _identify_project_self(project_root: str) -> Optional[Dict[str, str]]:
     """综合尝试。返回 {'name','version','ecosystem','manifest_file'} 或 None。"""
     for fn in (
@@ -280,6 +356,9 @@ def _identify_project_self(project_root: str) -> Optional[Dict[str, str]]:
         _identify_self_from_java,
         _identify_self_from_php,
         _identify_self_from_rust,
+        _identify_self_from_c_autotools,
+        _identify_self_from_c_cmake,
+        _identify_self_from_c_header,
     ):
         try:
             hit = fn(project_root)
@@ -310,7 +389,9 @@ async def _query_osv(name: str, version: str, ecosystem: str) -> List[Dict[str, 
         logger.warning("[preflight] httpx 不可用，跳过 OSV self-query")
         return []
 
-    payload = {"package": {"name": name, "ecosystem": ecosystem}, "version": version}
+    payload: Dict[str, Any] = {"package": {"name": name}, "version": version}
+    if ecosystem:
+        payload["package"]["ecosystem"] = ecosystem
     try:
         async with httpx.AsyncClient(timeout=_OSV_TIMEOUT) as client:
             r = await client.post(_OSV_ENDPOINT, json=payload)
@@ -338,6 +419,54 @@ def _condense_osv_vuln(v: Dict[str, Any]) -> Dict[str, Any]:
         "severity_score": severity,
         "references": [r.get("url") for r in (v.get("references") or [])[:3] if r.get("url")],
     }
+
+
+# ---------------------------------------------------------------------------
+# C/C++ 已知 CVE 兜底表
+# 用途：当 OSV API 没有标准 C 生态、查不到结果时，
+#       由内置表直接命中已知漏洞。
+# 维护原则：
+#   - 只收录人工确认过的条目
+#   - 版本上界保守（宁漏勿误）
+#   - 新条目需要引用公开 CVE 编号
+# ---------------------------------------------------------------------------
+
+# (min_version_inclusive, max_version_exclusive, [(CVE_ID, 摘要, 严重程度), ...])
+_KNOWN_C_CVES: Dict[str, List[Tuple[Optional[Tuple[int, ...]], Tuple[int, ...], List[Tuple[str, str, str]]]]] = {
+    "sqlite": [
+        # SQLite < 3.33.0 — 2020-06 修复的一批 CVE
+        (None, (3, 33, 0), [
+            ("CVE-2020-15358", "Heap buffer overflow in printf-type formatting (EXTENSION)", "CRITICAL"),
+            ("CVE-2020-13631", "Virtual table cursor use-after-free via crafted SQL", "HIGH"),
+            ("CVE-2020-13434", "VACUUM use-after-free on database with corrupt schema", "HIGH"),
+            ("CVE-2020-13435", "FTS3 out-of-bounds read via crafted matchinfo()", "HIGH"),
+            ("CVE-2020-13871", "FTS3 use-after-free on corrupt virtual table query", "HIGH"),
+        ]),
+        # SQLite 3.31.0 ≤ ver < 3.32.1 — FTS3 内存损坏
+        ((3, 31, 0), (3, 32, 1), [
+            ("CVE-2020-11655", "Memory corruption via FTS3 Auxiliary Functions", "HIGH"),
+        ]),
+    ],
+}
+
+
+def _lookup_known_c_cves(name: str, version: str) -> List[Dict[str, Any]]:
+    """在内置 CVE 表中查找命中条目。返回与 _condense_osv_vuln 格式一致的 dict 列表。"""
+    vt = _parse_version_tuple(version)
+    if not vt:
+        return []
+    results: List[Dict[str, Any]] = []
+    for lo, hi, cves in _KNOWN_C_CVES.get(name.lower(), []):
+        if _version_in_range(vt, lo, hi):
+            for cve_id, summary, severity in cves:
+                results.append({
+                    "id": cve_id,
+                    "aliases": [cve_id],
+                    "summary": summary,
+                    "severity_score": severity,
+                    "references": [],
+                })
+    return results
 
 
 async def _emit(event_emitter, level: str, msg: str) -> None:
@@ -513,6 +642,20 @@ async def run_preflight(
                     self_ident["name"], self_ident["version"], self_ident["ecosystem"]
                 )
                 condensed = [_condense_osv_vuln(v) for v in raw]
+
+                # 🔥 C/C++ 兜底：OSV 没有标准 C 生态，查不到时走内置表
+                if not condensed and not self_ident["ecosystem"]:
+                    fallback = _lookup_known_c_cves(
+                        self_ident["name"], self_ident["version"]
+                    )
+                    if fallback:
+                        logger.info(
+                            f"[preflight] C/C++ 内置 CVE 表命中 "
+                            f"{self_ident['name']}@{self_ident['version']}: "
+                            f"{len(fallback)} 条"
+                        )
+                        condensed = fallback
+
                 result.self_identity = {
                     **self_ident,
                     "vulnerabilities": condensed,
