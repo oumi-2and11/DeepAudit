@@ -556,8 +556,18 @@ def _extract_verification(finding: Dict[str, Any]) -> VerificationEvidence:
             primary_side = a_side if (a_side.get("reason") or a_side.get("output")) else b_side
             side_label = "A(动态沙箱)" if primary_side is a_side else "B(静态审查)"
 
-            if not method:
-                method = f"§7 双盲交叉复核 · {side_label}"
+            # 判断模式：双盲还是单侧
+            arb_mode = (arb or {}).get("mode", "")
+            if arb_mode == "single_agent":
+                # 单侧验证：只有 A 跑过，B 不存在，即使 A 空也不退 B
+                primary_side = a_side
+                side_label = "A(动态沙箱)"
+                mode_label = "§7 单侧验证"
+            else:
+                # 双盲：挑一边有实质内容的作为主证据来源，优先 A
+                primary_side = a_side if (a_side.get("reason") or a_side.get("output")) else b_side
+                side_label = "A(动态沙箱)" if primary_side is a_side else "B(静态审查)"
+                mode_label = "§7 双盲交叉复核"
             if not command:
                 command = str(
                     primary_side.get("command")

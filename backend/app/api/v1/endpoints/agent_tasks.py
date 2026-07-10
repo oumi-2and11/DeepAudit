@@ -4125,8 +4125,11 @@ async def generate_audit_report(
                         ec = EvidenceChain.from_finding(proxy_finding)
                     md_lines.append(ec.to_markdown())
                     # 🔥 §7 safety net: 如果 evidence_chain 的 verification 段不达标，
-                    # 但 cross_review 有数据（可能是旧数据或保存时遗漏），直接追加渲染
-                    if not ec.verification.is_meaningful() and isinstance(f.cross_review, dict) and f.cross_review:
+                    # 且 §7 主路径没渲过（method 不含 §7），才用 cross_review 补渲。
+                    # 防止主路径已渲但内容短（如 A 侧空返回）导致重复。
+                    if (not ec.verification.is_meaningful()
+                        and isinstance(f.cross_review, dict) and f.cross_review
+                        and "§7" not in (ec.verification.method or "")):
                         cr = f.cross_review
                         a = cr.get("A") if isinstance(cr.get("A"), dict) else {}
                         b = cr.get("B") if isinstance(cr.get("B"), dict) else {}
@@ -4134,8 +4137,11 @@ async def generate_audit_report(
                         side = a if (a.get("reason") or a.get("output")) else b
                         side_label = "A(动态沙箱)" if side is a else "B(静态审查)"
                         md_lines.append("")
+                        # 判断模式
+                        arb_mode = (ar or {}).get("mode", "")
+                        mode_label = "§7 单侧验证" if arb_mode == "single_agent" else "§7 双盲交叉复核"
                         md_lines.append("#### 4) 验证 (safety net: §7 cross_review 补渲)")
-                        md_lines.append(f"- **方法**: §7 双盲交叉复核 · {side_label}")
+                        md_lines.append(f"- **方法**: {mode_label} · {side_label}")
                         md_lines.append(f"- **判定**: {ar.get('verdict') or side.get('verdict') or 'unknown'}")
                         if side.get("reason"):
                             md_lines.append(f"- **{side_label} 理由**: {side.get('reason')[:300]}")

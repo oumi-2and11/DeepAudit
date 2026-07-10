@@ -1831,8 +1831,12 @@ Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
 
     def _select_cross_review_targets(self) -> List[Dict[str, Any]]:
         """
-        按 §7 范围筛选进入双盲的 finding：
-        - severity ∈ {critical, high}
+        按 §7 范围筛选进入复核的 finding：
+        - severity ∈ {critical, high} → 双盲 A+B
+        - severity = medium          → 单侧 A 验证
+
+        HIGH/CRITICAL 走完整双盲交叉复核；MEDIUM 走单侧（仅 A）验证以降低成本，
+        避免证据链空白的"未验证"状态。LOW 依旧走兜底路径。
 
         历史注解：早期版本额外要求 has_poc 或 needs_verification=True。实际跑下来
         Analysis 对高置信 finding 常常直接输出 needs_verification=False（"我很确定，
@@ -1841,14 +1845,16 @@ Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
         一律进双盲；PoC/needs_verification 只作为**加分项**（下面 metadata 里记录，
         不作为准入门槛）。
 
-        Medium/Low 依旧走 verified_single 兜底路径，不占双盲资源。
+        Medium 加单侧验证是在 2026-07 Bootstrap 4 轮实测后加上的补给 —— 之前的
+        Medium/Low 全部走 verified_single 兜底导致证据链空白，报告里的 MEDIUM 发现
+        一直显示"call_path 缺失、verification 缺失"。
         """
         targets = []
         for f in self._all_findings:
             if not isinstance(f, dict):
                 continue
             sev = str(f.get("severity", "")).lower()
-            if sev in ("critical", "high"):
+            if sev in ("critical", "high", "medium"):
                 targets.append(f)
         return targets
 
@@ -1858,14 +1864,14 @@ Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
         context: str,
     ) -> str:
         """
-        §7 双盲交叉复核主流程。
+        §7 交叉复核主流程（含 MEDIUM 单侧验证）。
 
         步骤：
-          1. 从 _all_findings 里挑出范围内的 finding（Critical/High + 有 PoC/needs_verify）
-          2. 每个 finding 拆两份包，分别喂给 verification_a（动态）/ verification_b（静态）
-          3. 各 Agent 独立跑一次（并行 asyncio.gather）；A、B 之间不共享结论
-          4. 按规则表 `_arbitrate` 合成 verdict + cross_review 证据链
-          5. 结果写回 self._all_findings；范围外的 finding 补 verdict=verified_single
+          1. 从 _all_findings 里挑出范围内的 finding（Critical/High/Medium）
+          2. HIGH/CRITICAL：拆两份包，分别喂给 A（动态）/ B（静态），并行双盲
+          3. MEDIUM：只跑 A（单侧验证），降低开销
+          4. 按规则表 `_arbitrate`（HIGH/CRITICAL）或简易裁决（MEDIUM）合成 verdict
+          5. 结果写回 self._all_findings；范围外的 finding（LOW）补默认 verdict
         """
         targets = self._select_cross_review_targets()
         logger.info(
@@ -1883,37 +1889,63 @@ Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
                         f["verdict"] = "verified_single" if f.get("is_verified") else "unverified"
             return (
                 "## §7 交叉复核\n\n"
-                "无 Critical/High + PoC 级别的 finding 需要双盲验证，跳过。"
+                "无 Critical/High/Medium 级别的 finding 需要验证，跳过。"
             )
+
+        # 统计各类别
+        high_crit = sum(1 for f in targets if str(f.get("severity", "")).lower() in ("critical", "high"))
+        medium = sum(1 for f in targets if str(f.get("severity", "")).lower() == "medium")
+        sev_summary_parts = []
+        if high_crit:
+            sev_summary_parts.append(f"{high_crit} 个 High/Critical 双盲")
+        if medium:
+            sev_summary_parts.append(f"{medium} 个 MEDIUM 单侧验证")
+        sev_summary = "、".join(sev_summary_parts)
 
         await self.emit_event(
             "cross_review_start",
-            f"🔀 §7 交叉复核开始：{len(targets)} 个 High/Critical finding 双盲复核",
+            f"🔀 §7 交叉复核开始：{sev_summary}",
             count=len(targets),
         )
 
-        # 逐条双盲（A/B 并行）
+        # 逐条复核：HIGH/CRITICAL 双盲 A+B；MEDIUM 单侧（仅 A）
         arb_results: List[Dict[str, Any]] = []
         for idx, finding in enumerate(targets):
             if self.is_cancelled:
                 logger.info("[CrossReview] Cancelled")
                 break
+
+            sev = str(finding.get("severity", "")).lower()
+            is_medium = sev == "medium"
+            method_label = "单侧验证" if is_medium else "双盲复核"
+
             await self.emit_event(
                 "cross_review_finding",
-                f"  [{idx+1}/{len(targets)}] 复核 {finding.get('file_path','?')}"
-                f":{finding.get('line_start', 0)}",
+                f"  [{idx+1}/{len(targets)}] {method_label}"
+                f" {finding.get('file_path','?')}:{finding.get('line_start', 0)}",
                 index=idx + 1,
                 total=len(targets),
             )
-            try:
-                a_out, b_out = await asyncio.gather(
-                    self._run_single_verifier("verification_a", finding, task),
-                    self._run_single_verifier("verification_b", finding, task),
-                    return_exceptions=True,
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"[CrossReview] gather 异常 idx={idx}: {e}")
-                a_out, b_out = None, None
+
+            if is_medium:
+                # MEDIUM：单侧验证（仅 A，降低开销）
+                try:
+                    a_out = await self._run_single_verifier("verification_a", finding, task)
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"[CrossReview] A 异常 idx={idx}: {e}")
+                    a_out = None
+                b_out = None
+            else:
+                # HIGH/CRITICAL：双盲 A+B 并行
+                try:
+                    a_out, b_out = await asyncio.gather(
+                        self._run_single_verifier("verification_a", finding, task),
+                        self._run_single_verifier("verification_b", finding, task),
+                        return_exceptions=True,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"[CrossReview] gather 异常 idx={idx}: {e}")
+                    a_out, b_out = None, None
 
             # 转异常为 None，不阻断整体
             if isinstance(a_out, Exception):
@@ -1923,7 +1955,46 @@ Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
                 logger.warning(f"[CrossReview] B 抛异常: {b_out}")
                 b_out = None
 
-            verdict, cross_review, updated_finding = self._arbitrate(finding, a_out, b_out)
+            if is_medium:
+                # MEDIUM 简易裁决：单侧 A 判定
+                a_v, a_hard, a_reason = self._normalize_verifier_output(a_out, side="A")
+                if a_v == "verified":
+                    verdict = "verified_single"
+                    arb_reason = f"A 单侧验证通过{'（含硬证据）' if a_hard else ''}"
+                elif a_v == "rejected":
+                    verdict = "false_positive"
+                    arb_reason = "A 单侧验证判定为误报"
+                else:
+                    verdict = "unverified"
+                    arb_reason = "A 单侧验证未返回有效结果"
+
+                cross_review = {
+                    "A": {
+                        "verdict": a_v,
+                        "hard_evidence": a_hard,
+                        "reason": a_reason,
+                        "evidence_kind": (a_out or {}).get("evidence_kind"),
+                        "verification_result": (a_out or {}).get("verification_result"),
+                        "verification_details": (a_out or {}).get("verification_details"),
+                        "call_path": (a_out or {}).get("call_path"),
+                    },
+                    "arbitration": {
+                        "verdict": verdict,
+                        "reason": arb_reason,
+                        "mode": "single_agent",
+                    },
+                }
+                updated_finding = dict(finding)
+                a_poc = (a_out or {}).get("poc")
+                if a_poc and not updated_finding.get("poc"):
+                    updated_finding["poc"] = a_poc
+                if (a_out or {}).get("call_path") and not updated_finding.get("call_path"):
+                    updated_finding["call_path"] = (a_out or {}).get("call_path")
+                if (a_out or {}).get("taint_flow") and not updated_finding.get("taint_flow"):
+                    updated_finding["taint_flow"] = (a_out or {}).get("taint_flow")
+                updated_finding["is_verified"] = verdict == "verified_single"
+            else:
+                verdict, cross_review, updated_finding = self._arbitrate(finding, a_out, b_out)
 
             # 就地覆盖 _all_findings 中的对应条目（通过 file+line 匹配）
             self._merge_verdict_into_all_findings(updated_finding, verdict, cross_review)
@@ -1955,7 +2026,7 @@ Agent 时，请优先复核上述 SCA / Secrets / SAST 命中是否可达。
         lines = [
             "## §7 交叉复核完成",
             "",
-            f"复核 {len(arb_results)} 条 High/Critical finding。判定分布：",
+            f"复核 {len(arb_results)} 条 finding（High/Critical 双盲 + Medium 单侧）。判定分布：",
             "",
         ]
         for k, v in stats.items():
